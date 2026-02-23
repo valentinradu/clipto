@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "clipto",
+    "clipd",
+    "clipto-ipc",
+]
+resolver = "2"
