@@ -4,6 +4,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use chacha20poly1305::{
@@ -33,7 +34,6 @@ impl Drop for EncryptedBuffer {
 struct State {
     cipher: ChaCha20Poly1305,
     buffer: Option<EncryptedBuffer>,
-    wayland: bool,
 }
 
 impl State {
@@ -43,10 +43,7 @@ impl State {
             .cipher
             .encrypt(&nonce, plaintext)
             .map_err(|_| anyhow::anyhow!("encryption failed"))?;
-        self.buffer = Some(EncryptedBuffer {
-            nonce: nonce.into(),
-            ciphertext,
-        });
+        self.buffer = Some(EncryptedBuffer { nonce: nonce.into(), ciphertext });
         Ok(())
     }
 
@@ -61,14 +58,18 @@ impl State {
     }
 }
 
+// ─── wayland socket detection ────────────────────────────────────────────────
+
+/// Returns the Wayland socket path if the compositor is actually reachable.
+fn wayland_socket() -> Option<PathBuf> {
+    let runtime_dir = std::env::var("XDG_RUNTIME_DIR").ok()?;
+    let display = std::env::var("WAYLAND_DISPLAY").ok()?;
+    let path = PathBuf::from(runtime_dir).join(display);
+    path.exists().then_some(path)
+}
+
 // ─── key loading ─────────────────────────────────────────────────────────────
 
-/// Load the 32-byte encryption key.
-///
-/// Production: reads from `$CREDENTIALS_DIRECTORY/clipto-key` (set by systemd
-/// when the service uses `LoadCredentialEncrypted`).
-///
-/// Development fallback: reads from the path in `$CLIPTO_KEY_FILE`.
 fn load_key() -> Result<Zeroizing<Vec<u8>>> {
     if let Ok(creds) = std::env::var("CREDENTIALS_DIRECTORY") {
         let path = PathBuf::from(&creds).join("clipto-key");
@@ -102,11 +103,12 @@ fn handle_connection(mut stream: UnixStream, state: Arc<Mutex<State>>) {
                 let mut st = state.lock().unwrap();
                 match st.store(&payload) {
                     Ok(()) => {
-                        let should_sync = st.wayland && source == CopySource::User;
+                        let should_sync = source == CopySource::User;
                         drop(st);
 
                         if should_sync {
-                            sync_to_wayland(&payload)?;
+                            // Best-effort: silently skip if Wayland isn't up.
+                            let _ = sync_to_wayland(&payload);
                         }
 
                         Response::Ok
@@ -135,7 +137,11 @@ fn handle_connection(mut stream: UnixStream, state: Arc<Mutex<State>>) {
 
 // ─── wayland sync ─────────────────────────────────────────────────────────────
 
+/// Forward payload to the Wayland compositor. Returns Ok(()) silently if no
+/// compositor is reachable — TTY sessions are expected to hit this path.
 fn sync_to_wayland(payload: &[u8]) -> Result<()> {
+    wayland_socket().context("no Wayland compositor")?;
+
     let mut child = Command::new("wl-copy")
         .stdin(Stdio::piped())
         .spawn()
@@ -149,31 +155,39 @@ fn sync_to_wayland(payload: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Spawn a thread that runs `wl-paste --watch clipto copy --source wayland`.
-/// wl-paste feeds new compositor clipboard content to clipto's stdin on each
-/// change. clipto sends it to the daemon with `source = Wayland` so the daemon
-/// stores it without calling wl-copy again.
+/// Spawn a thread that waits for the Wayland compositor to appear, then runs
+/// `wl-paste --watch` to sync compositor clipboard changes into the daemon.
+/// Restarts silently whenever the compositor disappears and comes back.
 fn start_wayland_watcher(clipto_bin: PathBuf) {
-    std::thread::spawn(move || loop {
-        let status = Command::new("wl-paste")
-            .args(["--watch", "--"])
-            .arg(&clipto_bin)
-            .args(["copy", "--source", "wayland"])
-            .status();
+    std::thread::spawn(move || {
+        let mut wayland_was_up = false;
 
-        match status {
-            Ok(s) if s.success() => {}
-            Ok(s) => eprintln!("wl-paste --watch exited: {s}"),
-            Err(e) => eprintln!("failed to start wl-paste --watch: {e}"),
+        loop {
+            if wayland_socket().is_some() {
+                wayland_was_up = true;
+
+                let status = Command::new("wl-paste")
+                    .args(["--watch", "--"])
+                    .arg(&clipto_bin)
+                    .args(["copy", "--source", "wayland"])
+                    .status();
+
+                // Only log if wl-paste exited unexpectedly (not a clean stop).
+                if let Err(e) = status {
+                    eprintln!("wl-paste --watch: {e}");
+                }
+            } else if wayland_was_up {
+                // Compositor just went away — log once, then go quiet.
+                eprintln!("Wayland compositor unreachable, watcher paused");
+                wayland_was_up = false;
+            }
+            // No compositor and never was: poll silently.
+
+            std::thread::sleep(Duration::from_secs(2));
         }
-
-        // Brief pause before restarting to avoid tight loops on persistent errors.
-        std::thread::sleep(std::time::Duration::from_secs(2));
     });
 }
 
-/// Resolve the path to the `clipto` binary: first look alongside the running
-/// `clipd` executable, then fall back to searching PATH.
 fn clipto_bin() -> PathBuf {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
@@ -199,17 +213,9 @@ fn main() -> Result<()> {
         .map_err(|_| anyhow::anyhow!("failed to create cipher from key"))?;
     drop(key);
 
-    let wayland = std::env::var("WAYLAND_DISPLAY").is_ok();
-
-    let state = Arc::new(Mutex::new(State {
-        cipher,
-        buffer: None,
-        wayland,
-    }));
+    let state = Arc::new(Mutex::new(State { cipher, buffer: None }));
 
     let socket_path = clipto_ipc::socket_path()?;
-
-    // Remove stale socket from a previous run.
     let _ = std::fs::remove_file(&socket_path);
 
     let listener = UnixListener::bind(&socket_path)
@@ -218,7 +224,6 @@ fn main() -> Result<()> {
     std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
         .context("failed to set socket permissions")?;
 
-    // Clean up socket on Ctrl-C / SIGTERM.
     {
         let path = socket_path.clone();
         ctrlc::set_handler(move || {
@@ -228,15 +233,10 @@ fn main() -> Result<()> {
         .context("failed to set signal handler")?;
     }
 
-    if wayland {
-        start_wayland_watcher(clipto_bin());
-    }
+    // Always start the watcher thread — it polls silently until Wayland appears.
+    start_wayland_watcher(clipto_bin());
 
-    eprintln!(
-        "clipd listening on {} (wayland={})",
-        socket_path.display(),
-        wayland
-    );
+    eprintln!("clipd listening on {}", socket_path.display());
 
     for stream in listener.incoming() {
         match stream {
