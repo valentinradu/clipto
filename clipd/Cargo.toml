@@ -10,3 +10,4 @@ zeroize = { version = "1", features = ["derive"] }
 rand = "0.8"
 anyhow = "1"
 ctrlc = "3"
+inotify = "0.10"

@@ -4,7 +4,6 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use chacha20poly1305::{
@@ -155,37 +154,79 @@ fn sync_to_wayland(payload: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Spawn a thread that waits for the Wayland compositor to appear, then runs
-/// `wl-paste --watch` to sync compositor clipboard changes into the daemon.
-/// Restarts silently whenever the compositor disappears and comes back.
+/// Spawn a thread that uses inotify to watch for the Wayland socket to appear
+/// in `$XDG_RUNTIME_DIR`. Starts `wl-paste --watch` when the socket is
+/// created, kills it when the socket is deleted. Zero polling.
 fn start_wayland_watcher(clipto_bin: PathBuf) {
+    use inotify::{EventMask, Inotify, WatchMask};
+
+    let runtime_dir = match std::env::var("XDG_RUNTIME_DIR") {
+        Ok(d) => d,
+        Err(_) => return, // no runtime dir, nothing to watch
+    };
+    let display = match std::env::var("WAYLAND_DISPLAY") {
+        Ok(d) => d,
+        Err(_) => return, // no display configured
+    };
+
     std::thread::spawn(move || {
-        let mut wayland_was_up = false;
+        let mut inotify = match Inotify::init() {
+            Ok(i) => i,
+            Err(e) => { eprintln!("inotify init: {e}"); return; }
+        };
 
+        if let Err(e) = inotify.watches().add(&runtime_dir, WatchMask::CREATE | WatchMask::DELETE) {
+            eprintln!("inotify watch: {e}");
+            return;
+        }
+
+        // If compositor is already up when the daemon starts, launch immediately.
+        let mut child: Option<std::process::Child> = if wayland_socket().is_some() {
+            spawn_wl_paste(&clipto_bin)
+        } else {
+            None
+        };
+
+        let mut buf = [0u8; 1024];
         loop {
-            if wayland_socket().is_some() {
-                wayland_was_up = true;
+            let events = match inotify.read_events_blocking(&mut buf) {
+                Ok(e) => e,
+                Err(e) => { eprintln!("inotify read: {e}"); break; }
+            };
 
-                let status = Command::new("wl-paste")
-                    .args(["--watch", "--"])
-                    .arg(&clipto_bin)
-                    .args(["copy", "--source", "wayland"])
-                    .status();
+            for event in events {
+                let name = match event.name {
+                    Some(n) => n.to_string_lossy().into_owned(),
+                    None => continue,
+                };
 
-                // Only log if wl-paste exited unexpectedly (not a clean stop).
-                if let Err(e) = status {
-                    eprintln!("wl-paste --watch: {e}");
+                if name != display {
+                    continue;
                 }
-            } else if wayland_was_up {
-                // Compositor just went away — log once, then go quiet.
-                eprintln!("Wayland compositor unreachable, watcher paused");
-                wayland_was_up = false;
-            }
-            // No compositor and never was: poll silently.
 
-            std::thread::sleep(Duration::from_secs(2));
+                if event.mask.contains(EventMask::CREATE) {
+                    child = spawn_wl_paste(&clipto_bin);
+                } else if event.mask.contains(EventMask::DELETE) {
+                    if let Some(mut c) = child.take() {
+                        let _ = c.kill();
+                        let _ = c.wait();
+                    }
+                }
+            }
         }
     });
+}
+
+fn spawn_wl_paste(clipto_bin: &PathBuf) -> Option<std::process::Child> {
+    match Command::new("wl-paste")
+        .args(["--watch", "--"])
+        .arg(clipto_bin)
+        .args(["copy", "--source", "wayland"])
+        .spawn()
+    {
+        Ok(child) => Some(child),
+        Err(e) => { eprintln!("wl-paste --watch: {e}"); None }
+    }
 }
 
 fn clipto_bin() -> PathBuf {
