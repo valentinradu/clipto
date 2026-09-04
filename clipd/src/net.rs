@@ -299,29 +299,43 @@ fn announce_loop(net: &Arc<Net>, queue: Receiver<Announcement>) {
             announcement = newer;
         }
 
+        // One thread for each machine. A machine that never answers the port
+        // costs a full connection timeout for each of its addresses, and the
+        // copy must not wait behind it to reach a machine that is up.
+        let mut sending = Vec::new();
         for node in net.registry.candidates() {
-            let mut message = PeerMessage::Announce {
+            let net = Arc::clone(net);
+            let message = PeerMessage::Announce {
                 machine_id: net.id.machine_id,
                 generation: announcement.generation,
                 meta: announcement.meta,
                 inline: announcement.inline.clone(),
             };
 
-            let sent = send_one(net, &node, &message);
+            sending.push(std::thread::spawn(move || {
+                let sent = send_one(&net, &node, &message);
 
-            // The clone above holds the plaintext. Erase it before the next
-            // machine gets its own copy.
-            if let PeerMessage::Announce {
-                inline: Some(inline),
-                ..
-            } = &mut message
-            {
-                inline.zeroize();
-            }
+                // This thread's own copy of the plaintext. Erase it here: the
+                // announcement itself lives until every machine has one.
+                let mut message = message;
+                if let PeerMessage::Announce {
+                    inline: Some(inline),
+                    ..
+                } = &mut message
+                {
+                    inline.zeroize();
+                }
 
-            if let Err(e) = sent {
-                eprintln!("peers: {} did not take the copy: {e:#}", node.hostname);
-            }
+                if let Err(e) = sent {
+                    eprintln!("peers: {} did not take the copy: {e:#}", node.hostname);
+                }
+            }));
+        }
+
+        // Wait for them all, so a burst of copies cannot pile up threads and
+        // the plaintext never outlives the announcement that carries it.
+        for thread in sending {
+            let _ = thread.join();
         }
     }
 }

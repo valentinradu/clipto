@@ -6,7 +6,7 @@
 //! the fetch and the last writer wins rule.
 
 use std::io::{Read, Write};
-use std::net::{Shutdown, TcpStream};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -251,6 +251,18 @@ impl Tailnet {
     }
 }
 
+/// A port that accepts a connection and then says nothing, like a machine that
+/// is up but answers no handshake. A dial to it stalls until the timeout.
+fn tarpit(address: &str, port: u16) {
+    let listener = TcpListener::bind((address, port)).unwrap();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for stream in listener.incoming().flatten() {
+            held.push(stream); // hold it open; never answer
+        }
+    });
+}
+
 /// Block until the daemon binds its port, then connect.
 fn connect_when_open(address: &str, port: u16) -> TcpStream {
     let deadline = Instant::now() + DEADLINE;
@@ -363,6 +375,43 @@ fn a_paste_fails_when_the_origin_is_gone() {
     assert!(
         message.contains("omen"),
         "the message must name the machine it cannot reach: {message}"
+    );
+}
+
+/// A machine that stalls the handshake must not delay the copy to a machine
+/// that is up. The daemon talks to every machine at once.
+///
+/// `aaa-tarpit` sorts before `edge`, so a daemon that announced one machine at
+/// a time would reach `edge` only after the stalled dial timed out.
+#[test]
+fn a_stalled_machine_does_not_delay_the_others() {
+    let net = Tailnet::new(17860);
+    tarpit("127.0.0.21", 17860);
+
+    let omen = net.start(
+        "omen",
+        "127.0.0.20",
+        &[("aaa-tarpit", "127.0.0.21"), ("edge", "127.0.0.22")],
+    );
+    let edge = net.start(
+        "edge",
+        "127.0.0.22",
+        &[("omen", "127.0.0.20"), ("aaa-tarpit", "127.0.0.21")],
+    );
+
+    omen.wait_for("edge");
+    edge.wait_for("omen");
+
+    let started = Instant::now();
+    omen.copy(b"past the tarpit", false);
+    edge.wait_for_payload(b"past the tarpit");
+
+    // One stalled dial costs five seconds. Arriving inside four proves the copy
+    // did not queue behind it.
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_secs(4),
+        "the copy waited {took:?} behind the stalled machine"
     );
 }
 
