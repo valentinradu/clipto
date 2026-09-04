@@ -133,17 +133,18 @@ impl State {
         self.write(generation, origin, CopySource::Remote, meta, bytes)
     }
 
-    /// Put the fetched bytes behind a promise. Does nothing when a newer copy
-    /// arrived while the fetch was running.
-    pub fn fulfill(&mut self, generation: u64, plaintext: &[u8]) -> Result<()> {
+    /// Put the bytes behind a promise. Answers whether it did: a newer copy may
+    /// have arrived while the fetch ran, and then there is no promise left.
+    pub fn fulfill(&mut self, generation: u64, plaintext: &[u8]) -> Result<bool> {
         let Some(clip) = &self.clip else {
-            return Ok(());
+            return Ok(false);
         };
         if clip.generation != generation || clip.buffer.is_some() {
-            return Ok(());
+            return Ok(false);
         }
         let (origin, source, meta) = (clip.origin, clip.source, clip.meta);
-        self.write(generation, origin, source, meta, Some(plaintext))
+        self.write(generation, origin, source, meta, Some(plaintext))?;
+        Ok(true)
     }
 
     /// Replace the clipboard. `plaintext` is `None` for a promise.

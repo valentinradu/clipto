@@ -249,11 +249,6 @@ impl Net {
             state.observe(generation);
 
             if !state.accepts(generation, origin) {
-                eprintln!(
-                    "clipboard: kept {} over generation {generation} from {}",
-                    state.describe(),
-                    self.registry.name_for(origin)
-                );
                 // Every session opens with a hello, and that hello names the
                 // same copy the announcement is about to carry. So the promise
                 // usually lands first, and the bytes that follow are no longer
@@ -263,10 +258,23 @@ impl Net {
                         eprintln!("peers: an announcement carried bytes it did not match");
                         return;
                     }
-                    if let Err(e) = state.fulfill(generation, bytes) {
-                        eprintln!("peers: failed to store a remote copy: {e:#}");
+                    match state.fulfill(generation, bytes) {
+                        Ok(true) => eprintln!(
+                            "clipboard: filled generation {generation} from {} ({} bytes)",
+                            self.registry.name_for(origin),
+                            meta.size
+                        ),
+                        Ok(false) => {}
+                        Err(e) => eprintln!("peers: failed to store a remote copy: {e:#}"),
                     }
+                    return;
                 }
+
+                eprintln!(
+                    "clipboard: kept {} over generation {generation} from {}",
+                    state.describe(),
+                    self.registry.name_for(origin)
+                );
                 return;
             }
 
