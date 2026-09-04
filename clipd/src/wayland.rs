@@ -157,7 +157,7 @@ impl Wayland {
                     match stored {
                         Ok((generation, meta)) => {
                             eprintln!(
-                                "clipboard: the compositor's selection is generation                                  {generation} ({} bytes)",
+                                "clipboard: a compositor copy is generation {generation} ({} bytes)",
                                 meta.size
                             );
                             if let Some(net) = &net {
