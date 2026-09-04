@@ -156,6 +156,10 @@ impl Wayland {
                             .store_local(&payload, sensitive, CopySource::Wayland);
                     match stored {
                         Ok((generation, meta)) => {
+                            eprintln!(
+                                "clipboard: the compositor's selection is generation                                  {generation} ({} bytes)",
+                                meta.size
+                            );
                             if let Some(net) = &net {
                                 net.announce(generation, meta, &payload);
                             }

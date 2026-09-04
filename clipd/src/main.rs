@@ -54,6 +54,10 @@ fn handle_connection(
                         if source == CopySource::User {
                             link.claim(sensitive);
                         }
+                        eprintln!(
+                            "clipboard: a local copy is generation {generation} ({} bytes)",
+                            meta.size
+                        );
                         if let Some(net) = &net {
                             net.announce(generation, meta, &payload);
                         }

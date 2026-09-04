@@ -249,6 +249,11 @@ impl Net {
             state.observe(generation);
 
             if !state.accepts(generation, origin) {
+                eprintln!(
+                    "clipboard: kept {} over generation {generation} from {}",
+                    state.describe(),
+                    self.registry.name_for(origin)
+                );
                 // Every session opens with a hello, and that hello names the
                 // same copy the announcement is about to carry. So the promise
                 // usually lands first, and the bytes that follow are no longer
@@ -269,6 +274,12 @@ impl Net {
                 eprintln!("peers: failed to store a remote copy: {e:#}");
                 return;
             }
+            eprintln!(
+                "clipboard: took generation {generation} from {} ({} bytes{})",
+                self.registry.name_for(origin),
+                meta.size,
+                if inline.is_some() { "" } else { ", a promise" }
+            );
         }
 
         // The daemon claims the local selection at once, even for a promise.

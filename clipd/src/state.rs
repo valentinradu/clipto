@@ -228,6 +228,18 @@ impl State {
         }
     }
 
+    /// The current clipboard, for a log line: which copy this machine holds.
+    pub fn describe(&self) -> String {
+        match &self.clip {
+            None => "an empty clipboard".to_string(),
+            Some(clip) => format!(
+                "generation {} from {}",
+                clip.generation,
+                crate::identity::format_id(&clip.origin)
+            ),
+        }
+    }
+
     /// Sensitivity of the stored payload, or None when the clipboard is empty.
     pub fn sensitive(&self) -> Option<bool> {
         self.clip.as_ref().map(|c| c.meta.sensitive)
