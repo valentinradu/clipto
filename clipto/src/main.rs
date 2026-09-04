@@ -23,16 +23,21 @@ struct Cli {
 enum Cmd {
     /// Read stdin and send it to the clipboard daemon.
     Copy {
-        /// Where this copy originated. Use `wayland` only when called from
-        /// `wl-paste --watch` to avoid a sync loop.
+        /// Where this copy originated. `wayland` means the compositor already
+        /// holds the payload, so the daemon stores it without claiming the
+        /// selection.
         #[arg(long, default_value = "user")]
         source: Source,
+        /// Mark the payload as a password, a key, or other secret content. The
+        /// daemon then asks a clipboard history tool not to keep it.
+        #[arg(long)]
+        sensitive: bool,
     },
     /// Fetch the current clipboard from the daemon and write it to stdout.
     Paste,
 }
 
-#[derive(ValueEnum, Clone)]
+#[derive(ValueEnum, Clone, Copy)]
 enum Source {
     User,
     Wayland,
@@ -51,8 +56,11 @@ impl From<Source> for CopySource {
 
 fn connect() -> Result<UnixStream> {
     let path = clipto_ipc::socket_path()?;
-    UnixStream::connect(&path)
-        .with_context(|| format!("failed to connect to clipd at {} — is clipd running?", path.display()))
+    let stream = UnixStream::connect(&path).with_context(|| {
+        format!("failed to connect to clipd at {} — is clipd running?", path.display())
+    })?;
+    clipto_ipc::set_timeouts(&stream)?;
+    Ok(stream)
 }
 
 // ─── main ─────────────────────────────────────────────────────────────────────
@@ -61,7 +69,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Cmd::Copy { source } => {
+        Cmd::Copy { source, sensitive } => {
             let mut payload = Vec::new();
             io::stdin()
                 .read_to_end(&mut payload)
@@ -70,7 +78,7 @@ fn main() -> Result<()> {
             let mut stream = connect()?;
             clipto_ipc::write_frame(
                 &mut stream,
-                &Request::Copy { payload, source: source.into() },
+                &Request::Copy { payload, source: source.into(), sensitive },
             )?;
 
             match clipto_ipc::read_frame::<Response>(&mut stream)? {

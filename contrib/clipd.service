@@ -1,12 +1,16 @@
 [Unit]
 Description=clipto clipboard daemon
-# Start after the Wayland session is available so WAYLAND_DISPLAY is set.
-After=graphical-session.target
+# No graphical session needed. clipd serves a TTY at once, and waits with
+# inotify for a compositor to appear.
+After=default.target
 
 [Service]
 ExecStart=%h/.local/bin/clipd
 Restart=on-failure
 RestartSec=2
+
+# A core dump would write the key and the clipboard plaintext to the disk.
+LimitCORE=0
 
 # Seal the encryption key to this machine via the TPM. Generate with:
 #   dd if=/dev/urandom bs=32 count=1 2>/dev/null \
@@ -15,4 +19,4 @@ RestartSec=2
 LoadCredentialEncrypted=clipto-key:%h/.config/clipto/clipto-key.cred
 
 [Install]
-WantedBy=graphical-session.target
+WantedBy=default.target

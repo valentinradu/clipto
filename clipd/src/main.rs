@@ -1,8 +1,6 @@
-use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
@@ -15,11 +13,16 @@ use zeroize::{Zeroize, Zeroizing};
 
 use clipto_ipc::{CopySource, Request, Response};
 
+mod wayland;
+
+pub use wayland::socket as wayland_socket;
+
 // ─── encrypted in-memory buffer ──────────────────────────────────────────────
 
 struct EncryptedBuffer {
     nonce: [u8; 12],
     ciphertext: Vec<u8>,
+    sensitive: bool,
 }
 
 impl Drop for EncryptedBuffer {
@@ -30,19 +33,23 @@ impl Drop for EncryptedBuffer {
 
 // ─── daemon state ─────────────────────────────────────────────────────────────
 
-struct State {
+pub struct State {
     cipher: ChaCha20Poly1305,
     buffer: Option<EncryptedBuffer>,
 }
 
 impl State {
-    fn store(&mut self, plaintext: &[u8]) -> Result<()> {
+    fn store(&mut self, plaintext: &[u8], sensitive: bool) -> Result<()> {
         let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
         let ciphertext = self
             .cipher
             .encrypt(&nonce, plaintext)
             .map_err(|_| anyhow::anyhow!("encryption failed"))?;
-        self.buffer = Some(EncryptedBuffer { nonce: nonce.into(), ciphertext });
+        self.buffer = Some(EncryptedBuffer {
+            nonce: nonce.into(),
+            ciphertext,
+            sensitive,
+        });
         Ok(())
     }
 
@@ -55,16 +62,11 @@ impl State {
             .map_err(|_| anyhow::anyhow!("decryption failed"))?;
         Ok(Zeroizing::new(plaintext))
     }
-}
 
-// ─── wayland socket detection ────────────────────────────────────────────────
-
-/// Returns the Wayland socket path if the compositor is actually reachable.
-fn wayland_socket() -> Option<PathBuf> {
-    let runtime_dir = std::env::var("XDG_RUNTIME_DIR").ok()?;
-    let display = std::env::var("WAYLAND_DISPLAY").ok()?;
-    let path = PathBuf::from(runtime_dir).join(display);
-    path.exists().then_some(path)
+    /// Sensitivity of the stored payload, or None when the clipboard is empty.
+    fn sensitive(&self) -> Option<bool> {
+        self.buffer.as_ref().map(|b| b.sensitive)
+    }
 }
 
 // ─── key loading ─────────────────────────────────────────────────────────────
@@ -93,152 +95,64 @@ fn load_key() -> Result<Zeroizing<Vec<u8>>> {
 
 // ─── connection handler ───────────────────────────────────────────────────────
 
-fn handle_connection(mut stream: UnixStream, state: Arc<Mutex<State>>) {
+fn handle_connection(mut stream: UnixStream, state: Arc<Mutex<State>>, link: Arc<wayland::Link>) {
     let result = (|| -> Result<()> {
+        clipto_ipc::set_timeouts(&stream)?;
+
         let request: Request = clipto_ipc::read_frame(&mut stream)?;
 
-        let response = match request {
-            Request::Copy { payload, source } => {
-                let mut st = state.lock().unwrap();
-                match st.store(&payload) {
+        let mut response = match request {
+            Request::Copy {
+                mut payload,
+                source,
+                sensitive,
+            } => {
+                let stored = state.lock().unwrap().store(&payload, sensitive);
+                payload.zeroize();
+
+                match stored {
                     Ok(()) => {
-                        let should_sync = source == CopySource::User;
-                        drop(st);
-
-                        if should_sync {
-                            // Best-effort: silently skip if Wayland isn't up.
-                            let _ = sync_to_wayland(&payload);
+                        // A Wayland copy is already the selection. Claiming it
+                        // again would take the richer formats away from its
+                        // owner.
+                        if source == CopySource::User {
+                            link.claim(sensitive);
                         }
-
                         Response::Ok
                     }
-                    Err(e) => Response::Error { message: e.to_string() },
+                    Err(e) => Response::Error {
+                        message: e.to_string(),
+                    },
                 }
             }
 
             Request::Paste => {
                 let st = state.lock().unwrap();
                 match st.load() {
-                    Ok(data) => Response::Payload { data: data.to_vec() },
-                    Err(e) => Response::Error { message: e.to_string() },
+                    Ok(data) => Response::Payload {
+                        data: data.to_vec(),
+                    },
+                    Err(e) => Response::Error {
+                        message: e.to_string(),
+                    },
                 }
             }
         };
 
         clipto_ipc::write_frame(&mut stream, &response)?;
+
+        // `load` gives a Zeroizing buffer, but `to_vec` above made a plain
+        // copy for the response. Erase that copy too.
+        if let Response::Payload { data } = &mut response {
+            data.zeroize();
+        }
+
         Ok(())
     })();
 
     if let Err(e) = result {
         eprintln!("connection error: {e:#}");
     }
-}
-
-// ─── wayland sync ─────────────────────────────────────────────────────────────
-
-/// Forward payload to the Wayland compositor. Returns Ok(()) silently if no
-/// compositor is reachable — TTY sessions are expected to hit this path.
-fn sync_to_wayland(payload: &[u8]) -> Result<()> {
-    wayland_socket().context("no Wayland compositor")?;
-
-    let mut child = Command::new("wl-copy")
-        .stdin(Stdio::piped())
-        .spawn()
-        .context("failed to spawn wl-copy")?;
-
-    if let Some(stdin) = child.stdin.as_mut() {
-        stdin.write_all(payload).context("failed to write to wl-copy")?;
-    }
-
-    child.wait().context("wl-copy failed")?;
-    Ok(())
-}
-
-/// Spawn a thread that uses inotify to watch for the Wayland socket to appear
-/// in `$XDG_RUNTIME_DIR`. Starts `wl-paste --watch` when the socket is
-/// created, kills it when the socket is deleted. Zero polling.
-fn start_wayland_watcher(clipto_bin: PathBuf) {
-    use inotify::{EventMask, Inotify, WatchMask};
-
-    let runtime_dir = match std::env::var("XDG_RUNTIME_DIR") {
-        Ok(d) => d,
-        Err(_) => return, // no runtime dir, nothing to watch
-    };
-    let display = match std::env::var("WAYLAND_DISPLAY") {
-        Ok(d) => d,
-        Err(_) => return, // no display configured
-    };
-
-    std::thread::spawn(move || {
-        let mut inotify = match Inotify::init() {
-            Ok(i) => i,
-            Err(e) => { eprintln!("inotify init: {e}"); return; }
-        };
-
-        if let Err(e) = inotify.watches().add(&runtime_dir, WatchMask::CREATE | WatchMask::DELETE) {
-            eprintln!("inotify watch: {e}");
-            return;
-        }
-
-        // If compositor is already up when the daemon starts, launch immediately.
-        let mut child: Option<std::process::Child> = if wayland_socket().is_some() {
-            spawn_wl_paste(&clipto_bin)
-        } else {
-            None
-        };
-
-        let mut buf = [0u8; 1024];
-        loop {
-            let events = match inotify.read_events_blocking(&mut buf) {
-                Ok(e) => e,
-                Err(e) => { eprintln!("inotify read: {e}"); break; }
-            };
-
-            for event in events {
-                let name = match event.name {
-                    Some(n) => n.to_string_lossy().into_owned(),
-                    None => continue,
-                };
-
-                if name != display {
-                    continue;
-                }
-
-                if event.mask.contains(EventMask::CREATE) {
-                    child = spawn_wl_paste(&clipto_bin);
-                } else if event.mask.contains(EventMask::DELETE) {
-                    if let Some(mut c) = child.take() {
-                        let _ = c.kill();
-                        let _ = c.wait();
-                    }
-                }
-            }
-        }
-    });
-}
-
-fn spawn_wl_paste(clipto_bin: &PathBuf) -> Option<std::process::Child> {
-    match Command::new("wl-paste")
-        .args(["--watch", "--"])
-        .arg(clipto_bin)
-        .args(["copy", "--source", "wayland"])
-        .spawn()
-    {
-        Ok(child) => Some(child),
-        Err(e) => { eprintln!("wl-paste --watch: {e}"); None }
-    }
-}
-
-fn clipto_bin() -> PathBuf {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let candidate = dir.join("clipto");
-            if candidate.exists() {
-                return candidate;
-            }
-        }
-    }
-    PathBuf::from("clipto")
 }
 
 // ─── main ─────────────────────────────────────────────────────────────────────
@@ -254,7 +168,10 @@ fn main() -> Result<()> {
         .map_err(|_| anyhow::anyhow!("failed to create cipher from key"))?;
     drop(key);
 
-    let state = Arc::new(Mutex::new(State { cipher, buffer: None }));
+    let state = Arc::new(Mutex::new(State {
+        cipher,
+        buffer: None,
+    }));
 
     let socket_path = clipto_ipc::socket_path()?;
     let _ = std::fs::remove_file(&socket_path);
@@ -274,8 +191,7 @@ fn main() -> Result<()> {
         .context("failed to set signal handler")?;
     }
 
-    // Always start the watcher thread — it polls silently until Wayland appears.
-    start_wayland_watcher(clipto_bin());
+    let link = wayland::start(Arc::clone(&state));
 
     eprintln!("clipd listening on {}", socket_path.display());
 
@@ -283,7 +199,8 @@ fn main() -> Result<()> {
         match stream {
             Ok(stream) => {
                 let state = Arc::clone(&state);
-                std::thread::spawn(move || handle_connection(stream, state));
+                let link = Arc::clone(&link);
+                std::thread::spawn(move || handle_connection(stream, state, link));
             }
             Err(e) => eprintln!("accept error: {e}"),
         }
