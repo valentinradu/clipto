@@ -247,9 +247,24 @@ impl Net {
         {
             let mut state = self.state.lock().unwrap();
             state.observe(generation);
+
             if !state.accepts(generation, origin) {
+                // Every session opens with a hello, and that hello names the
+                // same copy the announcement is about to carry. So the promise
+                // usually lands first, and the bytes that follow are no longer
+                // "newer" — but they are the bytes that promise is waiting for.
+                if let Some(bytes) = inline {
+                    if crate::state::meta_of(bytes, meta.sensitive).digest != meta.digest {
+                        eprintln!("peers: an announcement carried bytes it did not match");
+                        return;
+                    }
+                    if let Err(e) = state.fulfill(generation, bytes) {
+                        eprintln!("peers: failed to store a remote copy: {e:#}");
+                    }
+                }
                 return;
             }
+
             if let Err(e) = state.adopt(generation, origin, meta, inline) {
                 eprintln!("peers: failed to store a remote copy: {e:#}");
                 return;

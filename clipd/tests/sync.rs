@@ -366,6 +366,32 @@ fn a_paste_fails_when_the_origin_is_gone() {
     );
 }
 
+/// A small payload travels WITH the announcement, so the far machine holds the
+/// bytes and never needs a fetch.
+///
+/// Nothing pastes before the origin stops: a paste would fetch the bytes and
+/// hide the very fault this test looks for. Every session opens with a hello
+/// naming the same copy, so the promise lands first and the announcement's
+/// bytes arrive as "not newer" — they must still fill that promise.
+#[test]
+fn a_small_payload_needs_no_fetch() {
+    let net = Tailnet::new(17859);
+    let omen = net.start("omen", "127.0.0.18", &[("edge", "127.0.0.19")]);
+    let edge = net.start("edge", "127.0.0.19", &[("omen", "127.0.0.18")]);
+
+    omen.wait_for("edge");
+    edge.wait_for("omen");
+
+    omen.copy(b"small enough to ride along", false);
+    std::thread::sleep(Duration::from_secs(2));
+    drop(omen);
+
+    assert_eq!(
+        edge.paste().expect("edge kept only a promise it can no longer fetch"),
+        b"small enough to ride along"
+    );
+}
+
 /// A sensitive payload never travels with the announcement. The far machine
 /// therefore holds nothing once the origin stops.
 #[test]
