@@ -34,8 +34,11 @@ const MAX_FAILURES: u32 = 10;
 /// The window the failure count applies to.
 const FAILURE_WINDOW: Duration = Duration::from_secs(60);
 
-/// How long a connection for an announcement or a hello may take.
-const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a connection for an announcement or a hello may take. A machine on
+/// the same tailnet answers in well under this. The announcement waits for
+/// every machine before it starts the next one, so a generous value here is a
+/// delay on the NEXT copy, not just this one.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(3);
 
 // ─── the handle the daemon holds ──────────────────────────────────────────────
 

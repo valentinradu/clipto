@@ -24,7 +24,12 @@ use crate::identity::format_id;
 
 /// How long the daemon leaves a machine alone after the first failure. The
 /// wait doubles with each failure that follows.
-const FIRST_QUIET: Duration = Duration::from_secs(2);
+///
+/// One failure is enough to stop asking for a while. An announcement waits for
+/// every machine it tries, so a machine that is on the tailnet and answers
+/// nothing — a phone, a router, a server that runs no clipd — would otherwise
+/// put its whole connection timeout in front of the next copy.
+const FIRST_QUIET: Duration = Duration::from_secs(15);
 
 /// The longest the daemon leaves a machine alone. A phone and a router never
 /// answer, and this stops a retry on every copy.

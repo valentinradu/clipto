@@ -405,13 +405,20 @@ fn a_stalled_machine_does_not_delay_the_others() {
     let started = Instant::now();
     omen.copy(b"past the tarpit", false);
     edge.wait_for_payload(b"past the tarpit");
+    let first = started.elapsed();
 
-    // One stalled dial costs five seconds. Arriving inside four proves the copy
-    // did not queue behind it.
-    let took = started.elapsed();
+    // The announcement waits for every machine before it starts the next one,
+    // so a second copy is the one that queues behind a stalled dial.
+    let started = Instant::now();
+    omen.copy(b"and the second one too", false);
+    edge.wait_for_payload(b"and the second one too");
+    let second = started.elapsed();
+
+    // One stalled dial costs three seconds. Arriving inside two proves neither
+    // copy queued behind it.
     assert!(
-        took < Duration::from_secs(4),
-        "the copy waited {took:?} behind the stalled machine"
+        first < Duration::from_secs(2) && second < Duration::from_secs(2),
+        "the copies waited {first:?} then {second:?} behind the stalled machine"
     );
 }
 
