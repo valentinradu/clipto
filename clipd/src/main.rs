@@ -1,101 +1,35 @@
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{bail, Context, Result};
-use chacha20poly1305::{
-    aead::{Aead, AeadCore, KeyInit},
-    ChaCha20Poly1305, Nonce,
-};
-use rand::rngs::OsRng;
-use zeroize::{Zeroize, Zeroizing};
+use anyhow::{Context, Result};
+use chacha20poly1305::{aead::KeyInit, ChaCha20Poly1305};
+use zeroize::Zeroize;
 
 use clipto_ipc::{CopySource, Request, Response};
 
+mod config;
+mod discovery;
+mod identity;
+mod keys;
+mod net;
+mod noise;
+mod peers;
+mod state;
 mod wayland;
+
+use state::State;
 
 pub use wayland::socket as wayland_socket;
 
-// ─── encrypted in-memory buffer ──────────────────────────────────────────────
-
-struct EncryptedBuffer {
-    nonce: [u8; 12],
-    ciphertext: Vec<u8>,
-    sensitive: bool,
-}
-
-impl Drop for EncryptedBuffer {
-    fn drop(&mut self) {
-        self.ciphertext.zeroize();
-    }
-}
-
-// ─── daemon state ─────────────────────────────────────────────────────────────
-
-pub struct State {
-    cipher: ChaCha20Poly1305,
-    buffer: Option<EncryptedBuffer>,
-}
-
-impl State {
-    fn store(&mut self, plaintext: &[u8], sensitive: bool) -> Result<()> {
-        let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
-        let ciphertext = self
-            .cipher
-            .encrypt(&nonce, plaintext)
-            .map_err(|_| anyhow::anyhow!("encryption failed"))?;
-        self.buffer = Some(EncryptedBuffer {
-            nonce: nonce.into(),
-            ciphertext,
-            sensitive,
-        });
-        Ok(())
-    }
-
-    fn load(&self) -> Result<Zeroizing<Vec<u8>>> {
-        let buf = self.buffer.as_ref().context("clipboard is empty")?;
-        let nonce = Nonce::from_slice(&buf.nonce);
-        let plaintext = self
-            .cipher
-            .decrypt(nonce, buf.ciphertext.as_slice())
-            .map_err(|_| anyhow::anyhow!("decryption failed"))?;
-        Ok(Zeroizing::new(plaintext))
-    }
-
-    /// Sensitivity of the stored payload, or None when the clipboard is empty.
-    fn sensitive(&self) -> Option<bool> {
-        self.buffer.as_ref().map(|b| b.sensitive)
-    }
-}
-
-// ─── key loading ─────────────────────────────────────────────────────────────
-
-fn load_key() -> Result<Zeroizing<Vec<u8>>> {
-    if let Ok(creds) = std::env::var("CREDENTIALS_DIRECTORY") {
-        let path = PathBuf::from(&creds).join("clipto-key");
-        if path.exists() {
-            let key = std::fs::read(&path)
-                .with_context(|| format!("failed to read key from {}", path.display()))?;
-            return Ok(Zeroizing::new(key));
-        }
-    }
-
-    if let Ok(key_file) = std::env::var("CLIPTO_KEY_FILE") {
-        let key = std::fs::read(&key_file)
-            .with_context(|| format!("failed to read key from {key_file}"))?;
-        return Ok(Zeroizing::new(key));
-    }
-
-    bail!(
-        "no key found: run as a systemd service with LoadCredentialEncrypted=clipto-key:…, \
-         or set CLIPTO_KEY_FILE for development"
-    )
-}
-
 // ─── connection handler ───────────────────────────────────────────────────────
 
-fn handle_connection(mut stream: UnixStream, state: Arc<Mutex<State>>, link: Arc<wayland::Link>) {
+fn handle_connection(
+    mut stream: UnixStream,
+    state: Arc<Mutex<State>>,
+    link: Arc<wayland::Link>,
+    net: Option<Arc<net::Net>>,
+) {
     let result = (|| -> Result<()> {
         clipto_ipc::set_timeouts(&stream)?;
 
@@ -107,36 +41,50 @@ fn handle_connection(mut stream: UnixStream, state: Arc<Mutex<State>>, link: Arc
                 source,
                 sensitive,
             } => {
-                let stored = state.lock().unwrap().store(&payload, sensitive);
-                payload.zeroize();
+                let stored = state
+                    .lock()
+                    .unwrap()
+                    .store_local(&payload, sensitive, source);
 
-                match stored {
-                    Ok(()) => {
+                let answer = match stored {
+                    Ok((generation, meta)) => {
                         // A Wayland copy is already the selection. Claiming it
                         // again would take the richer formats away from its
                         // owner.
                         if source == CopySource::User {
                             link.claim(sensitive);
                         }
+                        if let Some(net) = &net {
+                            net.announce(generation, meta, &payload);
+                        }
                         Response::Ok
                     }
                     Err(e) => Response::Error {
                         message: e.to_string(),
                     },
-                }
+                };
+
+                payload.zeroize();
+                answer
             }
 
-            Request::Paste => {
-                let st = state.lock().unwrap();
-                match st.load() {
-                    Ok(data) => Response::Payload {
-                        data: data.to_vec(),
-                    },
-                    Err(e) => Response::Error {
-                        message: e.to_string(),
-                    },
-                }
-            }
+            Request::Paste => match net::payload_for_paste(&state, net.as_ref()) {
+                Ok(data) => Response::Payload {
+                    data: data.to_vec(),
+                },
+                Err(e) => Response::Error {
+                    message: format!("{e:#}"),
+                },
+            },
+
+            Request::Peers => match &net {
+                Some(net) => Response::Peers { peers: net.peers() },
+                None => Response::Error {
+                    message: "this daemon has no clipto-psk credential, so it shares the \
+                              clipboard with no other machine"
+                        .to_string(),
+                },
+            },
         };
 
         clipto_ipc::write_frame(&mut stream, &response)?;
@@ -158,20 +106,38 @@ fn handle_connection(mut stream: UnixStream, state: Arc<Mutex<State>>, link: Arc
 // ─── main ─────────────────────────────────────────────────────────────────────
 
 fn main() -> Result<()> {
-    let key = load_key()?;
-
-    if key.len() != 32 {
-        bail!("key must be exactly 32 bytes, got {}", key.len());
-    }
+    let config = config::load()?;
+    let key = keys::load_key()?;
 
     let cipher = ChaCha20Poly1305::new_from_slice(&key)
         .map_err(|_| anyhow::anyhow!("failed to create cipher from key"))?;
+
+    // The daemon runs with no network when the credential is absent. The local
+    // clipboard must keep working.
+    let identity = match identity::load_psk()? {
+        Some(psk) => Some(identity::derive(&key, psk)?),
+        None => {
+            eprintln!(
+                "clipd: no clipto-psk credential, so this machine shares the clipboard with \
+                 no other machine"
+            );
+            None
+        }
+    };
     drop(key);
 
-    let state = Arc::new(Mutex::new(State {
-        cipher,
-        buffer: None,
-    }));
+    let machine_id = identity.as_ref().map_or([0u8; 8], |id| id.machine_id);
+    let state = Arc::new(Mutex::new(State::new(cipher, machine_id)));
+    let link = Arc::new(wayland::Link::new());
+
+    let net = identity.map(|identity| {
+        eprintln!(
+            "clipd: machine {} on port {}",
+            identity::format_id(&identity.machine_id),
+            config.port
+        );
+        net::start(identity, config, Arc::clone(&state), Arc::clone(&link))
+    });
 
     let socket_path = clipto_ipc::socket_path()?;
     let _ = std::fs::remove_file(&socket_path);
@@ -191,7 +157,7 @@ fn main() -> Result<()> {
         .context("failed to set signal handler")?;
     }
 
-    let link = wayland::start(Arc::clone(&state));
+    wayland::start(Arc::clone(&state), Arc::clone(&link), net.clone());
 
     eprintln!("clipd listening on {}", socket_path.display());
 
@@ -200,7 +166,8 @@ fn main() -> Result<()> {
             Ok(stream) => {
                 let state = Arc::clone(&state);
                 let link = Arc::clone(&link);
-                std::thread::spawn(move || handle_connection(stream, state, link));
+                let net = net.clone();
+                std::thread::spawn(move || handle_connection(stream, state, link, net));
             }
             Err(e) => eprintln!("accept error: {e}"),
         }

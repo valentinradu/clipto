@@ -1,0 +1,20 @@
+# clipd configuration. Put this at ~/.config/clipto/config.toml.
+#
+# The file is optional, and every value below is the default.
+
+# The TCP port on the tailnet. The number is arbitrary.
+port = 17843
+
+# The largest payload that travels with an announcement, in bytes. A larger
+# payload stays where it was copied until the far machine pastes.
+inline_limit = 65536
+
+# False stops a payload marked with --sensitive at this machine.
+sync_sensitive = true
+
+# Seconds between two reads of the tailnet peer list.
+peer_refresh = 30
+
+# Seconds for one network fetch. Keep this well under the paste timeout, so a
+# paste never appears to hang.
+fetch_timeout = 2

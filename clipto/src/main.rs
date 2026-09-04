@@ -4,7 +4,7 @@ use std::os::unix::net::UnixStream;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
-use clipto_ipc::{CopySource, Request, Response};
+use clipto_ipc::{CopySource, PeerInfo, Request, Response};
 
 // ─── CLI definition ───────────────────────────────────────────────────────────
 
@@ -35,6 +35,8 @@ enum Cmd {
     },
     /// Fetch the current clipboard from the daemon and write it to stdout.
     Paste,
+    /// Print the machines that share this clipboard.
+    Peers,
 }
 
 #[derive(ValueEnum, Clone, Copy)]
@@ -49,6 +51,30 @@ impl From<Source> for CopySource {
             Source::User => CopySource::User,
             Source::Wayland => CopySource::Wayland,
         }
+    }
+}
+
+/// Print one line for each machine, in columns.
+fn print_peers(peers: &[PeerInfo]) {
+    if peers.is_empty() {
+        eprintln!("no other machine is on the tailnet");
+        return;
+    }
+
+    let name_width = peers.iter().map(|p| p.hostname.len()).max().unwrap_or(0);
+    let id_width = peers.iter().map(|p| p.machine_id.len()).max().unwrap_or(1);
+    let address_width = peers.iter().map(|p| p.address.len()).max().unwrap_or(0);
+
+    for peer in peers {
+        let id = if peer.machine_id.is_empty() {
+            "-"
+        } else {
+            &peer.machine_id
+        };
+        println!(
+            "{:name_width$}  {:id_width$}  {:address_width$}  {}",
+            peer.hostname, id, peer.address, peer.state
+        );
     }
 }
 
@@ -110,6 +136,23 @@ fn main() -> Result<()> {
                 }
                 _ => {
                     eprintln!("clipd: unexpected response to Paste");
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        Cmd::Peers => {
+            let mut stream = connect()?;
+            clipto_ipc::write_frame(&mut stream, &Request::Peers)?;
+
+            match clipto_ipc::read_frame::<Response>(&mut stream)? {
+                Response::Peers { peers } => print_peers(&peers),
+                Response::Error { message } => {
+                    eprintln!("clipd: {message}");
+                    std::process::exit(1);
+                }
+                _ => {
+                    eprintln!("clipd: unexpected response to Peers");
                     std::process::exit(1);
                 }
             }

@@ -14,9 +14,18 @@ LimitCORE=0
 
 # Seal the encryption key to this machine via the TPM. Generate with:
 #   dd if=/dev/urandom bs=32 count=1 2>/dev/null \
-#     | systemd-creds encrypt --name=clipto-key - \
+#     | systemd-creds encrypt --user --name=clipto-key - \
 #       %h/.config/clipto/clipto-key.cred
 LoadCredentialEncrypted=clipto-key:%h/.config/clipto/clipto-key.cred
+
+# The shared clipboard credential. The same 32 bytes go to every machine that
+# shares the clipboard. Generate them once, then seal them on each machine:
+#   dd if=/dev/urandom bs=32 count=1 2>/dev/null \
+#     | systemd-creds encrypt --user --name=clipto-psk - \
+#       %h/.config/clipto/clipto-psk.cred
+# Delete this line to keep the clipboard on this machine. systemd stops the
+# unit when the file is absent, so the line and the file go together.
+LoadCredentialEncrypted=clipto-psk:%h/.config/clipto/clipto-psk.cred
 
 [Install]
 WantedBy=default.target

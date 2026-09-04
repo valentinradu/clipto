@@ -28,7 +28,10 @@ use wayland_protocols::ext::data_control::v1::client::{
 };
 use zeroize::Zeroize;
 
-use crate::State;
+use clipto_ipc::CopySource;
+
+use crate::net::Net;
+use crate::state::State;
 
 /// The formats `clipd` offers, best first. The same list decides which format
 /// `clipd` asks for when it reads another client's selection.
@@ -57,6 +60,12 @@ pub struct Link {
 }
 
 impl Link {
+    pub fn new() -> Self {
+        Link {
+            session: Mutex::new(None),
+        }
+    }
+
     /// Take ownership of the selection. The payload stays encrypted until a
     /// client pastes. Does nothing when no compositor is reachable.
     pub fn claim(&self, sensitive: bool) {
@@ -112,6 +121,8 @@ impl Session {
 struct Wayland {
     clip: Arc<Mutex<State>>,
     session: Arc<Session>,
+    /// Empty while the daemon runs with no credential.
+    net: Option<Arc<Net>>,
     /// Formats announced for an offer, until its `selection` event arrives.
     offers: HashMap<ObjectId, Vec<String>>,
 }
@@ -132,14 +143,24 @@ impl Wayland {
         drop(writer);
 
         let clip = Arc::clone(&self.clip);
+        let net = self.net.clone();
         std::thread::spawn(move || {
             let mut payload = Vec::new();
             match std::io::BufReader::new(reader).read_to_end(&mut payload) {
                 // An empty selection is not an update. Keep what we have.
                 Ok(_) if payload.is_empty() => {}
                 Ok(_) => {
-                    if let Err(e) = clip.lock().unwrap().store(&payload, sensitive) {
-                        eprintln!("wayland: failed to store the selection: {e:#}");
+                    let stored =
+                        clip.lock()
+                            .unwrap()
+                            .store_local(&payload, sensitive, CopySource::Wayland);
+                    match stored {
+                        Ok((generation, meta)) => {
+                            if let Some(net) = &net {
+                                net.announce(generation, meta, &payload);
+                            }
+                        }
+                        Err(e) => eprintln!("wayland: failed to store the selection: {e:#}"),
                     }
                 }
                 Err(e) => eprintln!("wayland: failed to read the selection: {e}"),
@@ -292,11 +313,20 @@ impl Dispatch<ExtDataControlSourceV1, ()> for Wayland {
 
         match event {
             // Somebody pasted. This is the only place the plaintext exists.
+            //
+            // The bytes may sit on another machine, and then this thread
+            // fetches them first. The chain runs from the compositor, to this
+            // daemon, to the remote daemon.
             Event::Send { fd, .. } => {
-                let plaintext = state.clip.lock().unwrap().load();
+                let clip = Arc::clone(&state.clip);
+                let net = state.net.clone();
                 std::thread::spawn(move || {
-                    if let Ok(data) = plaintext {
-                        serve_paste(fd, &data);
+                    match crate::net::payload_for_paste(&clip, net.as_ref()) {
+                        Ok(data) => serve_paste(fd, &data),
+                        // Close the pipe and write nothing. Never serve the
+                        // older content instead: a silent stale paste is worse
+                        // than an empty one.
+                        Err(e) => eprintln!("wayland: a paste found no bytes: {e:#}"),
                     }
                 });
             }
@@ -322,14 +352,12 @@ impl Dispatch<ExtDataControlSourceV1, ()> for Wayland {
 
 /// Start the Wayland thread. It connects when a compositor appears, and
 /// reconnects when one restarts.
-pub fn start(clip: Arc<Mutex<State>>) -> Arc<Link> {
-    let link = Arc::new(Link { session: Mutex::new(None) });
-
+pub fn start(clip: Arc<Mutex<State>>, link: Arc<Link>, net: Option<Arc<Net>>) {
     let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") else {
-        return link; // nowhere to look for a compositor
+        return; // nowhere to look for a compositor
     };
 
-    let thread_link = Arc::clone(&link);
+    let thread_link = link;
     std::thread::spawn(move || {
         // True after a failed setup: the socket that is there now is known
         // bad, so wait for a different one instead of retrying it.
@@ -338,7 +366,7 @@ pub fn start(clip: Arc<Mutex<State>>) -> Arc<Link> {
         loop {
             if crate::wayland_socket().is_some() && !socket_is_bad {
                 let started = Instant::now();
-                match run(&clip, &thread_link) {
+                match run(&clip, &thread_link, net.clone()) {
                     // The connection ended. A new compositor may already be up.
                     Ok(()) => {
                         *thread_link.session.lock().unwrap() = None;
@@ -366,12 +394,10 @@ pub fn start(clip: Arc<Mutex<State>>) -> Arc<Link> {
             socket_is_bad = false;
         }
     });
-
-    link
 }
 
 /// Connect, claim the buffer, then dispatch until the connection ends.
-fn run(clip: &Arc<Mutex<State>>, link: &Arc<Link>) -> Result<()> {
+fn run(clip: &Arc<Mutex<State>>, link: &Arc<Link>, net: Option<Arc<Net>>) -> Result<()> {
     // Connect by path rather than by environment, because $WAYLAND_DISPLAY may
     // be unset when the daemon starts before the graphical session.
     let path = crate::wayland_socket().context("no compositor socket")?;
@@ -400,6 +426,7 @@ fn run(clip: &Arc<Mutex<State>>, link: &Arc<Link>) -> Result<()> {
     let mut state = Wayland {
         clip: Arc::clone(clip),
         session: Arc::clone(&session),
+        net,
         offers: HashMap::new(),
     };
 

@@ -15,10 +15,10 @@ pub const MAX_FRAME: usize = 64 * 1024 * 1024;
 /// on the first three bytes instead of misreading a length.
 const MAGIC: [u8; 2] = *b"CT";
 
-/// Bump this whenever `Request` or `Response` changes shape. `bincode` writes
-/// no field names, so two builds that disagree would otherwise read each
-/// other's bytes as nonsense.
-pub const PROTOCOL_VERSION: u8 = 1;
+/// Bump this whenever `Request`, `Response` or `PeerMessage` changes shape.
+/// `bincode` writes no field names, so two builds that disagree would otherwise
+/// read each other's bytes as nonsense.
+pub const PROTOCOL_VERSION: u8 = 2;
 
 /// How long one read or write on the socket may stall. A peer that connects
 /// and then goes quiet must not hold a thread for ever.
@@ -36,6 +36,19 @@ pub fn set_timeouts(stream: &UnixStream) -> Result<()> {
     Ok(())
 }
 
+/// Apply a timeout to a connected TCP socket. Same rule as `set_timeouts`, but
+/// the caller picks the value, because a network peer is slower than a socket
+/// on this machine.
+pub fn set_tcp_timeouts(stream: &std::net::TcpStream, timeout: Duration) -> Result<()> {
+    stream
+        .set_read_timeout(Some(timeout))
+        .context("failed to set the read timeout")?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .context("failed to set the write timeout")?;
+    Ok(())
+}
+
 /// Where a copy request originated. Controls whether the daemon claims the
 /// Wayland selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,6 +59,10 @@ pub enum CopySource {
     /// The payload is already the Wayland selection. The daemon stores it and
     /// claims nothing, because it must not take the selection from its owner.
     Wayland,
+    /// The payload comes from another machine. The daemon stores it and claims
+    /// the Wayland selection, but it announces nothing. That stops the echo
+    /// between two machines.
+    Remote,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -59,6 +76,8 @@ pub enum Request {
         sensitive: bool,
     },
     Paste,
+    /// Ask for the machines the daemon knows about.
+    Peers,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -66,6 +85,67 @@ pub enum Response {
     Ok,
     Payload { data: Vec<u8> },
     Error { message: String },
+    Peers { peers: Vec<PeerInfo> },
+}
+
+/// One machine, as `clipto peers` prints it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerInfo {
+    pub hostname: String,
+    pub address: String,
+    /// The tailnet says the machine is up.
+    pub online: bool,
+    /// The machine identifier, from the last successful handshake. Empty while
+    /// the daemon has never talked to that machine.
+    pub machine_id: String,
+    /// What the last connection attempt did.
+    pub state: String,
+}
+
+// ─── the messages between two machines ────────────────────────────────────────
+
+/// What one machine tells another about a clipboard payload. The bytes
+/// themselves travel only in `Announce.inline` or in `Payload`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct Meta {
+    pub size: u64,
+    pub sensitive: bool,
+    /// Lets a peer skip a fetch when it already holds this content.
+    pub digest: [u8; 32],
+}
+
+/// A message inside the Noise session. It travels in the same frame as a
+/// `Request`, so the magic, the version byte and the size cap already apply.
+#[derive(Debug, Serialize, Deserialize)]
+pub enum PeerMessage {
+    /// Sent by both sides after the handshake, and again to catch up.
+    Hello {
+        protocol_version: u8,
+        machine_id: [u8; 8],
+        generation: u64,
+        /// The machine that made the payload. It is not always the sender,
+        /// because a machine passes on what it took from a third machine.
+        origin: [u8; 8],
+        state: Option<Meta>,
+    },
+
+    /// Sent to every peer after a local copy. The sender is always the origin.
+    Announce {
+        machine_id: [u8; 8],
+        generation: u64,
+        meta: Meta,
+        /// Present for a small payload that is not sensitive. Absent
+        /// otherwise, and the peer then fetches the bytes when it needs them.
+        inline: Option<Vec<u8>>,
+    },
+
+    /// Ask the origin for the bytes of one generation.
+    Fetch { generation: u64 },
+
+    Payload { data: Vec<u8> },
+
+    /// The origin no longer holds that generation.
+    Gone,
 }
 
 /// Path to the daemon's Unix socket: `$XDG_RUNTIME_DIR/clipto.sock`.
