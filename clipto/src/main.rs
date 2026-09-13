@@ -4,7 +4,7 @@ use std::os::unix::net::UnixStream;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
-use clipto_ipc::{CopySource, PeerInfo, Request, Response};
+use clipto_ipc::{CopySource, PasteTarget, PeerInfo, Request, Response};
 
 // ─── CLI definition ───────────────────────────────────────────────────────────
 
@@ -37,6 +37,10 @@ enum Cmd {
     Paste,
     /// Print the machines that share this clipboard.
     Peers,
+    /// Greet every machine, take the highest generation, then print the
+    /// machines. Run this on a machine that just woke, to pull the copy it
+    /// missed before it waits for the next peer list read.
+    Sync,
 }
 
 #[derive(ValueEnum, Clone, Copy)]
@@ -122,7 +126,12 @@ fn main() -> Result<()> {
 
         Cmd::Paste => {
             let mut stream = connect()?;
-            clipto_ipc::write_frame(&mut stream, &Request::Paste)?;
+            clipto_ipc::write_frame(
+                &mut stream,
+                &Request::Paste {
+                    target: PasteTarget::Local,
+                },
+            )?;
 
             match clipto_ipc::read_frame::<Response>(&mut stream)? {
                 Response::Payload { data } => {
@@ -153,6 +162,24 @@ fn main() -> Result<()> {
                 }
                 _ => {
                     eprintln!("clipd: unexpected response to Peers");
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        Cmd::Sync => {
+            let mut stream = connect()?;
+            clipto_ipc::set_sync_timeout(&stream)?;
+            clipto_ipc::write_frame(&mut stream, &Request::Sync)?;
+
+            match clipto_ipc::read_frame::<Response>(&mut stream)? {
+                Response::Peers { peers } => print_peers(&peers),
+                Response::Error { message } => {
+                    eprintln!("clipd: {message}");
+                    std::process::exit(1);
+                }
+                _ => {
+                    eprintln!("clipd: unexpected response to Sync");
                     std::process::exit(1);
                 }
             }

@@ -6,10 +6,9 @@ use anyhow::{Context, Result};
 use chacha20poly1305::{aead::KeyInit, ChaCha20Poly1305};
 use zeroize::Zeroize;
 
-use clipto_ipc::{CopySource, Request, Response};
+use clipto_host::config;
+use clipto_ipc::{CopySource, PasteTarget, Request, Response};
 
-mod config;
-mod discovery;
 mod identity;
 mod keys;
 mod net;
@@ -22,6 +21,11 @@ use state::State;
 
 pub use wayland::socket as wayland_socket;
 
+/// The answer to a request that needs the other machines, on a daemon that
+/// holds no `clipto-psk`.
+const NO_CREDENTIAL: &str = "this daemon has no clipto-psk credential, so it shares the \
+                             clipboard with no other machine";
+
 // ─── connection handler ───────────────────────────────────────────────────────
 
 fn handle_connection(
@@ -29,6 +33,7 @@ fn handle_connection(
     state: Arc<Mutex<State>>,
     link: Arc<wayland::Link>,
     net: Option<Arc<net::Net>>,
+    web_sensitive: bool,
 ) {
     let result = (|| -> Result<()> {
         clipto_ipc::set_timeouts(&stream)?;
@@ -72,21 +77,46 @@ fn handle_connection(
                 answer
             }
 
-            Request::Paste => match net::payload_for_paste(&state, net.as_ref()) {
-                Ok(data) => Response::Payload {
-                    data: data.to_vec(),
-                },
-                Err(e) => Response::Error {
-                    message: format!("{e:#}"),
-                },
-            },
+            // The daemon applies the rule for the target itself. A payload the
+            // bridge must not send never crosses the socket into it, so the
+            // plaintext cannot leak from a process that then refuses to use it.
+            Request::Paste { target } => {
+                let refused = target == PasteTarget::Web
+                    && !web_sensitive
+                    && state.lock().unwrap().sensitive() == Some(true);
+
+                if refused {
+                    Response::Error {
+                        message: "the clipboard holds a sensitive payload, and web_sensitive \
+                                  is false"
+                            .to_string(),
+                    }
+                } else {
+                    match net::payload_for_paste(&state, net.as_ref()) {
+                        Ok(data) => Response::Payload {
+                            data: data.to_vec(),
+                        },
+                        Err(e) => Response::Error {
+                            message: format!("{e:#}"),
+                        },
+                    }
+                }
+            }
 
             Request::Peers => match &net {
                 Some(net) => Response::Peers { peers: net.peers() },
                 None => Response::Error {
-                    message: "this daemon has no clipto-psk credential, so it shares the \
-                              clipboard with no other machine"
-                        .to_string(),
+                    message: NO_CREDENTIAL.to_string(),
+                },
+            },
+
+            Request::Sync => match &net {
+                Some(net) => {
+                    net::catch_up(net);
+                    Response::Peers { peers: net.peers() }
+                }
+                None => Response::Error {
+                    message: NO_CREDENTIAL.to_string(),
                 },
             },
         };
@@ -130,6 +160,10 @@ fn main() -> Result<()> {
     };
     drop(key);
 
+    // `net::start` takes the configuration, and the paste path still needs this
+    // one rule.
+    let web_sensitive = config.web_sensitive;
+
     let machine_id = identity.as_ref().map_or([0u8; 8], |id| id.machine_id);
     let state = Arc::new(Mutex::new(State::new(cipher, machine_id)));
     let link = Arc::new(wayland::Link::new());
@@ -171,7 +205,9 @@ fn main() -> Result<()> {
                 let state = Arc::clone(&state);
                 let link = Arc::clone(&link);
                 let net = net.clone();
-                std::thread::spawn(move || handle_connection(stream, state, link, net));
+                std::thread::spawn(move || {
+                    handle_connection(stream, state, link, net, web_sensitive)
+                });
             }
             Err(e) => eprintln!("accept error: {e}"),
         }

@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 clipto-ipc = { path = "../clipto-ipc" }
+clipto-host = { path = "../clipto-host" }
 chacha20poly1305 = "0.10"
 zeroize = { version = "1", features = ["derive"] }
 rand = "0.8"
@@ -29,12 +30,12 @@ snow = { version = "0.10.0", default-features = false, features = [
 ] }
 hkdf = "0.12"
 sha2 = "0.10"
-toml = "0.8"
 serde_json = "1"
 hex = "0.4"
 serde = { version = "1.0.229", features = ["derive"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
-httparse = "1.10.1"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+# A test stops a daemon with SIGSTOP to make it miss an announcement.
+libc = "0.2.189"

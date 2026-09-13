@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use clipto_ipc::{CopySource, PeerInfo, Request, Response};
+use clipto_ipc::{CopySource, PasteTarget, PeerInfo, Request, Response};
 
 /// How long a test waits for a payload to cross.
 const DEADLINE: Duration = Duration::from_secs(45);
@@ -66,16 +66,52 @@ impl Machine {
     }
 
     fn paste(&self) -> Result<Vec<u8>, String> {
-        match self.ask(&Request::Paste) {
+        self.paste_to(PasteTarget::Local)
+    }
+
+    /// Paste as the bridge does. The daemon applies `web_sensitive` to this
+    /// target, and to no other.
+    fn paste_for_web(&self) -> Result<Vec<u8>, String> {
+        self.paste_to(PasteTarget::Web)
+    }
+
+    fn paste_to(&self, target: PasteTarget) -> Result<Vec<u8>, String> {
+        match self.ask(&Request::Paste { target }) {
             Response::Payload { data } => Ok(data),
             Response::Error { message } => Err(message),
             other => panic!("{} answered a paste with {other:?}", self.name),
         }
     }
 
+    /// Greet every machine now, and take the highest generation from the
+    /// answers.
+    fn sync(&self) -> Vec<PeerInfo> {
+        match self.ask(&Request::Sync) {
+            Response::Peers { peers } => peers,
+            other => panic!("{} answered a sync with {other:?}", self.name),
+        }
+    }
+
     /// Everything the daemon wrote to its log so far.
     fn log(&self) -> String {
         std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
+    /// Freeze the daemon, so it misses what arrives while it is down. This is
+    /// a machine that sleeps, without the wait.
+    fn freeze(&self) {
+        self.signal(libc::SIGSTOP);
+    }
+
+    fn thaw(&self) {
+        self.signal(libc::SIGCONT);
+    }
+
+    fn signal(&self, signal: i32) {
+        // The child is this test's own, and `Machine` owns it until it drops,
+        // so the identifier cannot name another process here.
+        let sent = unsafe { libc::kill(self.child.id() as libc::pid_t, signal) };
+        assert_eq!(sent, 0, "failed to signal {}", self.name);
     }
 
     fn peers(&self) -> Vec<PeerInfo> {
@@ -185,15 +221,18 @@ impl Tailnet {
 
     /// Start one daemon. `peers` is what its `tailscaled` reports.
     fn start(&self, name: &str, address: &str, peers: &[(&str, &str)]) -> Machine {
-        self.start_with(name, address, peers, &self.credential)
+        self.start_with(name, address, peers, &self.credential, "")
     }
 
+    /// `extra` holds configuration lines this machine needs on top of the
+    /// defaults.
     fn start_with(
         &self,
         name: &str,
         address: &str,
         peers: &[(&str, &str)],
         credential: &Path,
+        extra: &str,
     ) -> Machine {
         let home = self.root.path().join(name);
         let runtime = home.join("run");
@@ -206,7 +245,7 @@ impl Tailnet {
         std::fs::write(
             config.join("clipto").join("config.toml"),
             format!(
-                "port = {}\npeer_refresh = 1\nfetch_timeout = 10\n",
+                "port = {}\npeer_refresh = 1\nfetch_timeout = 10\n{extra}",
                 self.port
             ),
         )
@@ -332,7 +371,7 @@ fn a_wrong_credential_gets_nothing() {
     std::fs::write(&wrong, [7u8; 32]).unwrap();
 
     let omen = net.start("omen", "127.0.0.6", &[("edge", "127.0.0.7")]);
-    let edge = net.start_with("edge", "127.0.0.7", &[("omen", "127.0.0.6")], &wrong);
+    let edge = net.start_with("edge", "127.0.0.7", &[("omen", "127.0.0.6")], &wrong, "");
 
     omen.copy(b"a secret plan", false);
 
@@ -553,6 +592,84 @@ fn a_probe_with_no_credential_is_rejected_and_logged() {
 
     // The daemon keeps working.
     assert_eq!(omen.paste().unwrap(), b"not for you");
+}
+
+/// A sync catches a running machine up on demand.
+///
+/// This is what lets the phone hold one name with every machine behind it. The
+/// machine it happens to reach greets the others first, so any machine gives
+/// the same answer.
+///
+/// The automatic catch-up cannot do this job. It greets a machine the daemon
+/// has not talked to yet, and `edge` here has already joined `omen`.
+#[test]
+fn a_sync_catches_a_running_machine_up() {
+    let net = Tailnet::new(17861);
+    let omen = net.start("omen", "127.0.0.23", &[("edge", "127.0.0.24")]);
+    let edge = net.start("edge", "127.0.0.24", &[("omen", "127.0.0.23")]);
+
+    omen.wait_for("edge");
+    edge.wait_for("omen");
+
+    omen.copy(b"before the nap", false);
+    edge.wait_for_payload(b"before the nap");
+
+    // `edge` answers nothing while it is frozen, so the announcement never
+    // lands. The dial costs `omen` one three-second timeout.
+    edge.freeze();
+    omen.copy(b"while edge napped", false);
+    std::thread::sleep(Duration::from_secs(6));
+    edge.thaw();
+
+    assert_eq!(
+        edge.paste().unwrap(),
+        b"before the nap",
+        "edge caught up on its own, so this test proves nothing about the sync"
+    );
+
+    edge.sync();
+    assert_eq!(edge.paste().unwrap(), b"while edge napped");
+}
+
+/// `web_sensitive` is false by default, so a password never reaches the bridge.
+/// A paste on the machine itself still gets it.
+#[test]
+fn the_bridge_gets_no_sensitive_payload_by_default() {
+    let net = Tailnet::new(17862);
+    let omen = net.start("omen", "127.0.0.25", &[]);
+
+    omen.copy(b"a password", true);
+
+    assert_eq!(omen.paste().unwrap(), b"a password");
+
+    let message = omen
+        .paste_for_web()
+        .expect_err("the bridge read a sensitive payload");
+    assert!(
+        message.contains("web_sensitive"),
+        "the message must name the rule that refused it: {message}"
+    );
+}
+
+/// `web_sensitive = true` lets the same payload through to the bridge. The rule
+/// applies to that target only, so a payload that is not sensitive always
+/// crosses.
+#[test]
+fn web_sensitive_lets_a_password_through() {
+    let net = Tailnet::new(17863);
+    let omen = net.start_with(
+        "omen",
+        "127.0.0.26",
+        &[],
+        &net.credential,
+        "web_sensitive = true\n",
+    );
+
+    omen.copy(b"a password", true);
+    assert_eq!(omen.paste_for_web().unwrap(), b"a password");
+
+    omen.copy(b"ordinary text", false);
+    assert_eq!(omen.paste_for_web().unwrap(), b"ordinary text");
 }
 
 /// A machine that sleeps misses the announcements. It greets every machine at

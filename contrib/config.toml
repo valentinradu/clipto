@@ -16,5 +16,28 @@ sync_sensitive = true
 peer_refresh = 30
 
 # Seconds for one network fetch. Keep this well under the paste timeout, so a
-# paste never appears to hang.
+# paste never appears to hang. A sync spends this once for each address a
+# machine holds, and a phone waits for that sync.
 fetch_timeout = 2
+
+# ─── the bridge for a phone (clipweb) ────────────────────────────────────────
+#
+# clipweb reads this same file. Both programs refuse a key they do not know, so
+# every key lives here whichever program uses it.
+
+# The TCP port the bridge listens on. The number is arbitrary.
+web_port = 17844
+
+# False keeps a payload marked with --sensitive away from the bridge. The
+# daemon applies this rule itself, so such a payload never reaches the bridge
+# at all.
+web_sensitive = false
+
+# A node must carry this tag before the bridge answers it. The tag comes from
+# the netmap, which the control server signs, so a node cannot claim one.
+web_tag = "tag:clipto"
+
+# The network device the bridge binds. Linux hands a packet to a socket bound
+# to an address even when the packet arrived on another device, so the address
+# alone does not keep the LAN out. An empty string turns this off.
+web_device = "tailscale0"

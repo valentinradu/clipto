@@ -1,38 +1,37 @@
 //! The clipboard across machines.
 //!
-//! The tailnet is the transport, not the identity. Any node on the tailnet may
-//! reach the port, so the handshake is the only gate. Three rules follow:
+//! Two gates guard this port, and they answer different questions.
+//!
+//! The access rules on the tailnet decide who reaches the port at all. The
+//! handshake decides who gets a payload. The second gate stands alone, because
+//! the control server writes the first one and this daemon must not depend on
+//! it. Three rules follow from that:
 //!
 //! 1. The daemon sends nothing before the handshake completes. A peer that
 //!    fails learns no version, no generation number and no size.
 //! 2. The daemon limits the handshake attempts for each source address.
 //! 3. The daemon writes a log line for each failure with the source address.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use zeroize::{Zeroize, Zeroizing};
 
+use clipto_host::config::Config;
+use clipto_host::limit::Limiter;
+use clipto_host::tailscale::{self, Node};
 use clipto_ipc::{Meta, PeerInfo, PeerMessage, PROTOCOL_VERSION};
 
-use crate::config::Config;
-use crate::discovery::{self, Node};
 use crate::identity::{format_id, Identity};
 use crate::noise::{self, NoiseIo};
 use crate::peers::Registry;
 use crate::state::{Content, State};
 use crate::wayland;
-
-/// Failed handshakes one address may make inside `FAILURE_WINDOW`.
-const MAX_FAILURES: u32 = 10;
-
-/// The window the failure count applies to.
-const FAILURE_WINDOW: Duration = Duration::from_secs(60);
 
 /// How long a connection for an announcement or a hello may take. A machine on
 /// the same tailnet answers in well under this. The announcement waits for
@@ -377,7 +376,7 @@ fn discover_loop(net: &Arc<Net>) {
     let mut online_before: HashSet<String> = HashSet::new();
 
     loop {
-        match discovery::status() {
+        match tailscale::status() {
             Ok(status) => {
                 listen(net, &status.own_addresses);
 
@@ -403,7 +402,7 @@ fn discover_loop(net: &Arc<Net>) {
                 for node in net.registry.ungreeted() {
                     let net = Arc::clone(net);
                     std::thread::spawn(move || {
-                        if let Err(e) = greet(&net, &node) {
+                        if let Err(e) = greet(&net, &node, DIAL_TIMEOUT) {
                             eprintln!("peers: {} did not answer a hello: {e:#}", node.hostname);
                         }
                     });
@@ -430,9 +429,41 @@ fn wait(net: &Arc<Net>) {
     *asked = false;
 }
 
+/// Greet every machine that is worth an attempt, and wait for the answers.
+///
+/// A machine that slept missed the announcements, so its buffer is behind. The
+/// hello repairs that. A client that must read the newest copy — the bridge,
+/// before it answers a phone — calls this first, and then any machine it
+/// reached gives the same answer.
+///
+/// One thread for each machine, so a slow machine does not hold up the others.
+/// `candidates` already drops the machines that are offline and the ones in
+/// their quiet window, so a machine that never answers costs nothing after its
+/// first failure.
+///
+/// The wait uses `fetch_timeout`, not `DIAL_TIMEOUT`: a client waits for this
+/// call, and `dial` spends the timeout once for each address a machine holds.
+pub fn catch_up(net: &Arc<Net>) {
+    let mut greeting = Vec::new();
+    let timeout = net.config.fetch_timeout();
+
+    for node in net.registry.candidates() {
+        let net = Arc::clone(net);
+        greeting.push(std::thread::spawn(move || {
+            if let Err(e) = greet(&net, &node, timeout) {
+                eprintln!("peers: {} did not answer a hello: {e:#}", node.hostname);
+            }
+        }));
+    }
+
+    for thread in greeting {
+        let _ = thread.join();
+    }
+}
+
 /// Exchange a hello and take what the other machine reports.
-fn greet(net: &Arc<Net>, node: &Node) -> Result<()> {
-    let (_, hello) = net.dial(node, DIAL_TIMEOUT)?;
+fn greet(net: &Arc<Net>, node: &Node, timeout: Duration) -> Result<()> {
+    let (_, hello) = net.dial(node, timeout)?;
 
     if let PeerMessage::Hello {
         generation,
@@ -618,42 +649,6 @@ fn dispatch<S: Read + Write>(net: &Arc<Net>, io: &mut NoiseIo<S>, sender: [u8; 8
     }
 
     Ok(())
-}
-
-// ─── the rate limit ───────────────────────────────────────────────────────────
-
-/// Counts the failed handshakes for each source address.
-#[derive(Default)]
-struct Limiter {
-    failures: HashMap<IpAddr, (u32, Instant)>,
-}
-
-impl Limiter {
-    fn allow(&mut self, address: IpAddr) -> bool {
-        match self.failures.get(&address) {
-            Some((count, since)) if *count >= MAX_FAILURES => {
-                if since.elapsed() >= FAILURE_WINDOW {
-                    self.failures.remove(&address);
-                    true
-                } else {
-                    false
-                }
-            }
-            _ => true,
-        }
-    }
-
-    fn failed(&mut self, address: IpAddr) {
-        let entry = self.failures.entry(address).or_insert((0, Instant::now()));
-        if entry.1.elapsed() >= FAILURE_WINDOW {
-            *entry = (0, Instant::now());
-        }
-        entry.0 += 1;
-    }
-
-    fn passed(&mut self, address: IpAddr) {
-        self.failures.remove(&address);
-    }
 }
 
 // ─── the paste path ───────────────────────────────────────────────────────────

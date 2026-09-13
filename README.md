@@ -2,7 +2,7 @@
 
 A secure clipboard daemon for Linux, bridging tmux (TTY and Wayland), the
 Wayland compositor, any environment that can invoke a CLI — and, over a
-Tailscale network, your other machines.
+Tailscale network, your other machines and your phone.
 
 ## The problem
 
@@ -53,6 +53,7 @@ selection through `ext-data-control-v1`. It spawns no helper process — no
  │  clipto copy      │  reads stdin, sends to daemon
  │  clipto paste     │  requests from daemon, prints to stdout
  │  clipto peers     │  prints the machines that share the clipboard
+ │  clipto sync      │  greets every machine, then prints them
  └───────────────────┘
        |
  tmux `y` binding   →  clipto copy
@@ -108,6 +109,10 @@ The daemon holds two credentials. They do different work.
 |---|---|---|
 | `clipto-key` | one machine | Encrypts the buffer in memory. Never leaves. |
 | `clipto-psk` | every machine | Gates the handshake. Encrypts nothing. |
+
+There is no third credential for the phone. The bridge reads the node identity
+that WireGuard already proved, so nothing goes on the phone to be copied, and
+nothing has to be rotated when the phone leaves.
 
 The daemon derives its machine identity from the key it already holds, so it
 stores no new file and you run no new command:
@@ -204,9 +209,92 @@ A node that runs nothing, such as a phone, cannot break the discovery. The
 daemon caches which machines answer the port, and it waits longer after each
 failure, up to five minutes.
 
+## The clipboard on a phone
+
+A phone cannot run `clipd`. It holds no key, it cannot run the handshake, and
+iOS lets nothing listen on a port in the background. So `clipweb` bridges it:
+the phone stays a client of the machines, and it never becomes one.
+
+```
+   the phone                        any machine
+ ┌────────────┐                   ┌──────────────────────┐
+ │  Shortcuts │──── HTTP ────────▶│  clipweb :17844      │
+ └────────────┘   over the tailnet│         │            │
+                                  │         │ the socket │
+                                  │  clipd ◀┘            │
+                                  └──────────┬───────────┘
+                                             │ Noise, to the other machines
+```
+
+### The phone names no machine
+
+One DNS name holds every machine:
+
+```
+clipto.example.ts  →  100.83.1.11, 100.83.1.12
+```
+
+iOS connects by name. It gets every address and it keeps the connection that
+opens first, so the phone reaches **a** machine.
+
+That is enough because the bridge answers for the mesh, not for its own
+machine. It asks the daemon to greet every machine first, so **any** machine
+that answers gives the same clipboard. A machine that slept is no longer a
+wrong answer, only a slower one.
+
+The same catch-up is on the CLI as `clipto sync`.
+
+### The gate is the node key
+
+The bridge holds no token. A packet reaches it only out of a WireGuard tunnel,
+and only the holder of that node's private key can put one there. So the bridge
+asks its own `tailscaled` who sent it:
+
+```bash
+tailscale whois 100.83.1.13
+# Machine:
+#   Name:    iphone.example.ts
+#   Tags:    tag:admin, tag:clipto
+```
+
+The node must carry `web_tag`. Nothing else opens the door.
+
+| | A bearer token | The node key |
+|---|---|---|
+| What proves it | A copied string | A key exchange, each session |
+| Where it rests | In the shortcut, in plain text | In the Tailscale app keychain |
+| Copy it and win | Yes | No |
+| Take it away | Rotate the secret on every machine | Delete the node record |
+
+### The two endpoints
+
+```bash
+# paste on the phone
+GET  http://clipto.example.ts:17844/v1/clipboard   → 200 text/plain
+
+# copy from the phone
+POST http://clipto.example.ts:17844/v1/clipboard   → 204
+#   X-Clipto-Sensitive: 1   marks the copy a password
+```
+
+There is no HTTPS and no browser. Shortcuts is not a browser, so it needs no
+secure context, and WireGuard already encrypts the hop.
+
+A POST goes to one machine and stops there. The daemon raises the generation
+and announces it, so one POST reaches every machine.
+
+### What this costs
+
+The plaintext now crosses the tailnet to a phone. Everywhere else it crosses
+one owner-only socket on one machine. So `web_sensitive` is `false`: a payload
+marked `--sensitive` never reaches the bridge at all. The daemon applies that
+rule itself, so such a payload does not enter the bridge and then get refused.
+
 ### Configuration
 
 `~/.config/clipto/config.toml` is optional, and every value has a default.
+`clipd` and `clipweb` read the same file, and both refuse a key they do not
+know, so every key belongs here whichever program uses it.
 
 ```toml
 port = 17843
@@ -214,6 +302,11 @@ inline_limit = 65536      # bytes sent with the announcement
 sync_sensitive = true     # false stops a sensitive payload at the machine
 peer_refresh = 30         # seconds between two peer list reads
 fetch_timeout = 2         # seconds for one network fetch
+
+web_port = 17844          # the bridge for a phone
+web_sensitive = false     # true lets a password reach the phone
+web_tag = "tag:clipto"    # a node must carry this tag
+web_device = "tailscale0" # the device the bridge binds; empty turns this off
 ```
 
 ## Security model
@@ -232,18 +325,48 @@ fetch_timeout = 2         # seconds for one network fetch
   `zeroize` before they are dropped.
 - The Unix socket is `chmod 600` (owner-only). No other user can connect.
 - Plaintext crosses the socket only in the `Paste` response — over a socket
-  that is owner-only and local to the machine.
+  that is owner-only and local to the machine. The one exception is the bridge:
+  it carries plaintext to a phone, over the tailnet. `web_sensitive = false`
+  keeps a password out of that path.
 - The unit file sets `LimitCORE=0`. A core dump would write both the key and
   the clipboard plaintext to the disk.
 - A frame larger than `MAX_FRAME` (64 MiB) is refused. The length prefix comes
   from the peer, so the cap stops a bad peer from exhausting memory.
 
-### The network gate
+### The two gates
 
-The tailnet is the transport, not the identity. Every node on the tailnet can
-reach the port, so the handshake is the only gate. `clipto` adds no Tailscale
-tag and no access control list. Three rules follow, and the daemon obeys all
-three:
+Two gates guard the ports, and they answer different questions.
+
+| Gate | What it decides | Who enforces it |
+|---|---|---|
+| `tag:clipto` | Who reaches the port | Each node's own packet filter |
+| `clipto-psk`, or the node identity | Who gets a payload | The daemon, or the bridge |
+
+**The first gate.** An access rule on the tailnet lets a tagged node reach a
+tagged node, and nobody else. Each node's `tailscaled` enforces it from the
+netmap the control server signs, so it is a real gate and not advice.
+
+```json
+{
+  "tagOwners": { "tag:clipto": ["operator@"] },
+  "acls": [
+    { "action": "accept",
+      "src": ["tag:clipto"],
+      "dst": ["tag:clipto:17843-17844"] }
+  ]
+}
+```
+
+**The second gate stands alone**, because the control server writes the first
+one. A machine proves itself with `clipto-psk`. A phone cannot run that
+handshake, so it proves itself with its node key instead, which is the same
+proof WireGuard already made.
+
+Neither gate calls the control server at the moment it decides. Both read the
+netmap that `tailscaled` already holds, so both keep working while the control
+server is unreachable.
+
+Three rules follow for the daemon, and it obeys all three:
 
 1. **The daemon sends nothing before the handshake completes.** A peer that
    fails learns no version, no generation number and no size.
@@ -258,8 +381,13 @@ that shows a different key for the same machine identifier is refused. You
 remove one machine by deleting its record. You rotate the credential only to
 lock out a machine that still holds it.
 
-The listener binds the Tailscale addresses only, both IPv4 and IPv6. It never
-binds `0.0.0.0`, so the port does not appear on the LAN.
+Both listeners bind the Tailscale addresses only, IPv4 and IPv6. Neither one
+binds `0.0.0.0`, so the ports do not appear on the LAN.
+
+The bridge goes one step further and binds the `tailscale0` device as well.
+Linux hands a packet to a socket bound to an address even when the packet
+arrived on another device, so the address alone does not keep the LAN out. The
+daemon does not need this, because its handshake refuses such a packet anyway.
 
 ### Sensitive payloads
 
@@ -287,6 +415,13 @@ payload, and `sync_sensitive = false` keeps it on this machine entirely.
   `sync_sensitive = false` when that is too much.
 - **No authentication on the socket.** Any process running as you can copy and
   paste. The socket mode is the only barrier.
+- **Whoever owns the control server writes the tags.** They can therefore give
+  a node of their own `tag:clipto` and reach the bridge. Tailnet lock is the
+  answer to that, and Headscale does not implement it. `clipto-psk` is what
+  stands behind it: it gates the daemons, and the control server never sees it.
+- **Every app on a tagged phone can call the bridge.** Such an app can also
+  read the system clipboard directly, which is what the bridge serves, so this
+  opens nothing that the phone did not already open.
 
 ## Workspace structure
 
@@ -295,20 +430,26 @@ clipto/
 ├── Cargo.toml            # workspace
 ├── clipto-ipc/           # shared protocol types (serde + bincode)
 │   └── src/lib.rs        # Request / Response / PeerMessage enums
+├── clipto-host/          # what both binaries need from this machine
+│   ├── src/config.rs     # ~/.config/clipto/config.toml
+│   ├── src/tailscale.rs  # the tailscaled local API: status and whois
+│   └── src/limit.rs      # the failure limit for one source address
 ├── clipd/                # daemon binary
 │   ├── src/main.rs       # key, Unix socket, request handling
 │   ├── src/state.rs      # the encrypted buffer, the generation, the promise
 │   ├── src/wayland.rs    # ext-data-control client: owns the selection
-│   ├── src/config.rs     # ~/.config/clipto/config.toml
 │   ├── src/keys.rs       # systemd credentials
 │   ├── src/identity.rs   # the machine identity, derived from the key
-│   ├── src/discovery.rs  # the tailscaled local API client
 │   ├── src/peers.rs      # the machine records and the reachability cache
 │   ├── src/noise.rs      # the Noise handshake and the encrypted stream
-│   ├── src/net.rs        # the listener, the announcement, the fetch
+│   ├── src/net.rs        # the listener, the announcement, the fetch, the sync
 │   └── tests/sync.rs     # two daemons, one fake tailnet, one clipboard
+├── clipweb/              # the bridge for a phone
+│   ├── src/main.rs       # the listener, the node identity gate, the routes
+│   ├── src/http.rs       # one request in, one answer out
+│   └── tests/bridge.rs   # a real bridge, a fake tailnet, a fake daemon
 └── clipto/               # CLI binary
-    └── src/main.rs       # `copy`, `paste` and `peers` subcommands
+    └── src/main.rs       # `copy`, `paste`, `peers` and `sync` subcommands
 ```
 
 ## IPC protocol
@@ -324,10 +465,16 @@ pub enum CopySource {
     Remote,   // from another machine — claim it, announce nothing
 }
 
+pub enum PasteTarget {
+    Local,    // a client on this machine, over the owner-only socket
+    Web,      // the bridge, which sends the payload to a phone
+}
+
 pub enum Request {
     Copy { payload: Vec<u8>, source: CopySource, sensitive: bool },
-    Paste,
+    Paste { target: PasteTarget },
     Peers,
+    Sync,     // greet every machine, then report them
 }
 
 pub enum Response {
@@ -364,6 +511,15 @@ payload, claim the selection, but do not send it back where it came from.
 
 `sensitive` marks a password or a key. The daemon then offers
 `x-kde-passwordManagerHint` alongside the text formats.
+
+`target` says where the payload goes, so the daemon applies its own rule for
+each one. `web_sensitive = false` refuses a sensitive payload for `Web`, and
+the bridge therefore never holds one.
+
+`Sync` greets every machine that answers and takes the highest generation, then
+reports the machines. It answers with `Peers`, so `clipto sync` prints the same
+table as `clipto peers`, after the catch-up. A sync outlasts the 5-second
+timeout, so a client widens the read timeout before it sends one.
 
 ## The protocol between two machines
 
@@ -480,19 +636,87 @@ is often missing that early, so `clipd` falls back to the lowest-numbered
 
 ### 6. Tailscale
 
-Nothing required beyond `tailscale up`. `clipd` reads the peer list from
-`tailscaled` over `/var/run/tailscale/tailscaled.sock`, and it spawns no
-process. `CLIPTO_TAILSCALED_SOCK` overrides the path.
+Nothing required beyond `tailscale up`. Both programs read `tailscaled` over
+`/var/run/tailscale/tailscaled.sock`, and neither one spawns a process.
+`CLIPTO_TAILSCALED_SOCK` overrides the path.
 
-Do not add a Tailscale tag or an access control list for `clipto`. The
-credential is the gate, and a tag would only hide a machine you can already
-remove by deleting its record.
+Add the access rule from [The two gates](#the-two-gates), and give every machine
+and the phone `tag:clipto`. A machine takes it from the key it registers with:
+
+```bash
+tailscale up --auth-key=<key> --advertise-tags=tag:admin,tag:clipto
+```
+
+The iOS app advertises no tag, so set the phone's on the control server. **Pass
+every tag the node already holds.** `headscale nodes tag` says it adds a tag,
+and it does not: it replaces the whole set. A node that loses `tag:admin` here
+matches no access rule at all, and an iPhone cannot re-register itself from a
+shell.
+
+```bash
+headscale nodes list -o json | jq -r '.[]|"\(.id) \(.given_name) \(.tags)"'
+# 8 iphone ["tag:admin"]
+
+headscale nodes tag -i 8 -t tag:admin -t tag:clipto
+```
+
+### 7. The phone
+
+Skip this to keep the clipboard on your machines.
+
+Install `clipweb` and its unit from `contrib/clipweb.service`:
+
+```bash
+systemctl --user enable --now clipweb
+```
+
+Add one DNS record that holds every machine, so the phone names none. In
+Headscale:
+
+```yaml
+dns:
+  extra_records:
+    - { name: "clipto.example.ts", type: "A", value: "100.83.1.11" }
+    - { name: "clipto.example.ts", type: "A", value: "100.83.1.12" }
+```
+
+One address for each machine that runs the bridge. A machine that runs no
+`clipd` does not belong here, and neither does a name: the record needs an
+address.
+
+Then build two shortcuts on the phone.
+
+**Paste from clipto**
+
+```
+1. Get Contents of URL
+     URL     http://clipto.example.ts:17844/v1/clipboard
+     Method  GET
+2. Copy to Clipboard
+```
+
+**Copy to clipto**
+
+```
+1. Get Clipboard
+2. Get Contents of URL
+     URL     http://clipto.example.ts:17844/v1/clipboard
+     Method  POST
+     Body    Text → the Clipboard variable
+```
+
+Set the second one to **Receive Text from the Share Sheet** as well. You then
+send text to the clipboard from any app, and you touch the clipboard never.
+
+The Tailscale app must hold the connection. The shortcut fails when it does
+not, so add a notification for the failure.
 
 ## Building
 
 ```bash
 cargo build --release
-# binaries at target/release/clipto and target/release/clipd
+# binaries at target/release/clipto, target/release/clipd and
+# target/release/clipweb
 ```
 
 ## Testing
@@ -500,6 +724,11 @@ cargo build --release
 ```bash
 cargo test
 ```
+
+`clipweb/tests/bridge.rs` starts a real bridge. One small server plays
+`tailscaled` and answers `whois`, and a second one plays `clipd`, so the node
+identity gate, the routing and the requests to the daemon all run. Each request
+comes from its own source address, because that address is what the gate reads.
 
 `clipd/tests/sync.rs` starts two real daemons. A small server on a Unix socket
 plays `tailscaled`, and each daemon binds its own loopback address, so the

@@ -1,0 +1,22 @@
+[package]
+name = "clipweb"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clipto-ipc = { path = "../clipto-ipc" }
+clipto-host = { path = "../clipto-host" }
+anyhow = "1"
+httparse = "1.10.1"
+zeroize = "1"
+# `bind_device` wraps SO_BINDTODEVICE. A hand-written version would need a
+# sockaddr for each address family, in unsafe code, inside the listener that
+# keeps the LAN out.
+# `all` is the feature that carries `bind_device`.
+socket2 = { version = "0.5", features = ["all"] }
+
+[dev-dependencies]
+clipto-ipc = { path = "../clipto-ipc" }
+socket2 = { version = "0.5", features = ["all"] }
+tempfile = "3.27.0"
+serde_json = "1"

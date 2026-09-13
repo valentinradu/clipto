@@ -19,7 +19,8 @@ use serde::{Deserialize, Serialize};
 
 use clipto_ipc::PeerInfo;
 
-use crate::discovery::Node;
+use clipto_host::tailscale::Node;
+
 use crate::identity::format_id;
 
 /// How long the daemon leaves a machine alone after the first failure. The

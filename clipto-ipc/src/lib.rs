@@ -18,7 +18,7 @@ const MAGIC: [u8; 2] = *b"CT";
 /// Bump this whenever `Request`, `Response` or `PeerMessage` changes shape.
 /// `bincode` writes no field names, so two builds that disagree would otherwise
 /// read each other's bytes as nonsense.
-pub const PROTOCOL_VERSION: u8 = 2;
+pub const PROTOCOL_VERSION: u8 = 3;
 
 /// How long one read or write on the socket may stall. A peer that connects
 /// and then goes quiet must not hold a thread for ever.
@@ -34,6 +34,20 @@ pub fn set_timeouts(stream: &UnixStream) -> Result<()> {
         .set_write_timeout(Some(IO_TIMEOUT))
         .context("failed to set the write timeout")?;
     Ok(())
+}
+
+/// How long a client waits for the answer to `Request::Sync`.
+///
+/// The daemon greets every machine before it answers, and each greeting spends
+/// `fetch_timeout` once for every address that machine holds. So a sync
+/// outlasts `IO_TIMEOUT`, and the client must say so before it sends one.
+pub const SYNC_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Widen the read timeout for a socket that is about to carry a `Sync`.
+pub fn set_sync_timeout(stream: &UnixStream) -> Result<()> {
+    stream
+        .set_read_timeout(Some(SYNC_TIMEOUT))
+        .context("failed to set the sync timeout")
 }
 
 /// Apply a timeout to a connected TCP socket. Same rule as `set_timeouts`, but
@@ -65,6 +79,17 @@ pub enum CopySource {
     Remote,
 }
 
+/// Where a paste is going. The daemon applies its own rule for each one, so a
+/// payload it must not release never leaves it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PasteTarget {
+    /// A client on this machine, over the owner-only socket.
+    Local,
+    /// The bridge, which sends the payload to a phone over the tailnet.
+    /// `web_sensitive = false` refuses a sensitive payload for this target.
+    Web,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Request {
     Copy {
@@ -75,9 +100,15 @@ pub enum Request {
         /// clipboard history tool not to keep the payload.
         sensitive: bool,
     },
-    Paste,
+    Paste {
+        target: PasteTarget,
+    },
     /// Ask for the machines the daemon knows about.
     Peers,
+    /// Greet every machine that answers, take the highest generation, then
+    /// report the machines. A machine that slept holds an older copy, so a
+    /// client that must read the newest one asks for this first.
+    Sync,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
