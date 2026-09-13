@@ -244,6 +244,18 @@ wrong answer, only a slower one.
 
 The same catch-up is on the CLI as `clipto sync`.
 
+**Check that your name server returns every address.** Headscale's
+`extra_records` does not: it is a map keyed by name, so it serves the first
+address and drops the rest. The phone then has no failover, and it reaches one
+machine or nothing. A name server that holds several A records for one name —
+`blocky`, `dnsmasq`, `unbound` — gives you the whole set:
+
+```bash
+dig @100.100.100.100 clipto.example.ts A +short
+# 100.83.1.11
+# 100.83.1.12      ← both, or the failover does not exist
+```
+
 ### The gate is the node key
 
 The bridge holds no token. A packet reaches it only out of a WireGuard tunnel,
