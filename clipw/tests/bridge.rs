@@ -1,6 +1,6 @@
 //! The bridge answers a phone, and it refuses everything else.
 //!
-//! The test starts a real `clipweb`. A small server on a Unix socket plays
+//! The test starts a real `clipw`. A small server on a Unix socket plays
 //! `tailscaled`, and a second one plays `clipd`, so the whole path runs: the
 //! node identity gate, the routing, and the requests the bridge sends to the
 //! daemon.
@@ -21,10 +21,10 @@ use clipto_ipc::{PasteTarget, Request, Response};
 /// How long a test waits for the bridge to open its port.
 const DEADLINE: Duration = Duration::from_secs(30);
 
-/// The node that carries `tag:clipto`. The phone.
+/// The node that carries `tag:admin`. The phone.
 const PHONE: &str = "127.0.0.41";
 
-/// A node on the tailnet with no `tag:clipto`.
+/// A node on the tailnet with no `tag:admin`.
 const STRANGER: &str = "127.0.0.42";
 
 /// An address the netmap does not hold at all.
@@ -38,7 +38,7 @@ struct Daemon {
 
 // ─── the fake daemon ──────────────────────────────────────────────────────────
 
-/// Answer the requests `clipweb` sends, and record each one.
+/// Answer the requests `clipw` sends, and record each one.
 fn fake_clipd(path: &Path, daemon: Daemon) {
     let listener = UnixListener::bind(path).unwrap();
     std::thread::spawn(move || {
@@ -142,7 +142,7 @@ fn read_head(stream: &mut UnixStream) -> Option<String> {
 fn whois(head: &str) -> String {
     if head.contains(&format!("{PHONE}%3A")) {
         serde_json::json!({
-            "Node": { "Name": "iphone.example.ts.", "Tags": ["tag:admin", "tag:clipto"] },
+            "Node": { "Name": "iphone.example.ts.", "Tags": ["tag:admin"] },
         })
         .to_string()
     } else if head.contains(&format!("{STRANGER}%3A")) {
@@ -199,7 +199,7 @@ impl Bridge {
         let tailscaled = home.join("tailscaled.sock");
         fake_tailscaled(&tailscaled, address.to_string());
 
-        let child = Command::new(env!("CARGO_BIN_EXE_clipweb"))
+        let child = Command::new(env!("CARGO_BIN_EXE_clipw"))
             .env_clear()
             .env("HOME", &home)
             .env("XDG_RUNTIME_DIR", &runtime)
@@ -208,7 +208,7 @@ impl Bridge {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .expect("failed to start clipweb");
+            .expect("failed to start clipw");
 
         let target: SocketAddr = format!("{address}:{port}").parse().unwrap();
         wait_until_open(target);
@@ -285,7 +285,7 @@ fn the_phone_gets_the_clipboard() {
     );
 }
 
-/// A node with no `tag:clipto` gets nothing, and the daemon is never asked.
+/// A node with no `tag:admin` gets nothing, and the daemon is never asked.
 /// The gate runs before the bridge reads a request.
 #[test]
 fn a_node_without_the_tag_is_refused() {
@@ -294,7 +294,7 @@ fn a_node_without_the_tag_is_refused() {
     let answer = bridge.ask(STRANGER, "GET /v1/clipboard HTTP/1.1\r\n\r\n");
 
     assert!(answer.starts_with("HTTP/1.1 403 Forbidden\r\n"), "{answer}");
-    assert!(answer.contains("tag:clipto"), "{answer}");
+    assert!(answer.contains("tag:admin"), "{answer}");
     assert!(!answer.contains("not for you"), "{answer}");
     assert!(
         bridge.seen().is_empty(),

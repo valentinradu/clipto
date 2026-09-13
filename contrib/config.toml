@@ -20,9 +20,9 @@ peer_refresh = 30
 # machine holds, and a phone waits for that sync.
 fetch_timeout = 2
 
-# ─── the bridge for a phone (clipweb) ────────────────────────────────────────
+# ─── the bridge for a phone (clipw) ────────────────────────────────────────
 #
-# clipweb reads this same file. Both programs refuse a key they do not know, so
+# clipw reads this same file. Both programs refuse a key they do not know, so
 # every key lives here whichever program uses it.
 
 # The TCP port the bridge listens on. The number is arbitrary.
@@ -35,7 +35,7 @@ web_sensitive = false
 
 # A node must carry this tag before the bridge answers it. The tag comes from
 # the netmap, which the control server signs, so a node cannot claim one.
-web_tag = "tag:clipto"
+web_tag = "tag:admin"
 
 # The network device the bridge binds. Linux hands a packet to a socket bound
 # to an address even when the packet arrived on another device, so the address

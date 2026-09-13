@@ -1,4 +1,4 @@
-//! What `clipd` and `clipweb` both need from the machine they run on.
+//! What `clipd` and `clipw` both need from the machine they run on.
 //!
 //! The configuration file, the `tailscaled` lookups, and the failure limit for
 //! one source address. Both binaries read the same `config.toml`, so the type

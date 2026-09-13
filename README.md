@@ -212,13 +212,13 @@ failure, up to five minutes.
 ## The clipboard on a phone
 
 A phone cannot run `clipd`. It holds no key, it cannot run the handshake, and
-iOS lets nothing listen on a port in the background. So `clipweb` bridges it:
+iOS lets nothing listen on a port in the background. So `clipw` bridges it:
 the phone stays a client of the machines, and it never becomes one.
 
 ```
    the phone                        any machine
  ┌────────────┐                   ┌──────────────────────┐
- │  Shortcuts │──── HTTP ────────▶│  clipweb :17844      │
+ │  Shortcuts │──── HTTP ────────▶│  clipw :17844      │
  └────────────┘   over the tailnet│         │            │
                                   │         │ the socket │
                                   │  clipd ◀┘            │
@@ -266,7 +266,7 @@ asks its own `tailscaled` who sent it:
 tailscale whois 100.83.1.13
 # Machine:
 #   Name:    iphone.example.ts
-#   Tags:    tag:admin, tag:clipto
+#   Tags:    tag:admin
 ```
 
 The node must carry `web_tag`. Nothing else opens the door.
@@ -305,7 +305,7 @@ rule itself, so such a payload does not enter the bridge and then get refused.
 ### Configuration
 
 `~/.config/clipto/config.toml` is optional, and every value has a default.
-`clipd` and `clipweb` read the same file, and both refuse a key they do not
+`clipd` and `clipw` read the same file, and both refuse a key they do not
 know, so every key belongs here whichever program uses it.
 
 ```toml
@@ -317,7 +317,7 @@ fetch_timeout = 2         # seconds for one network fetch
 
 web_port = 17844          # the bridge for a phone
 web_sensitive = false     # true lets a password reach the phone
-web_tag = "tag:clipto"    # a node must carry this tag
+web_tag = "tag:admin"    # a node must carry this tag
 web_device = "tailscale0" # the device the bridge binds; empty turns this off
 ```
 
@@ -351,20 +351,25 @@ Two gates guard the ports, and they answer different questions.
 
 | Gate | What it decides | Who enforces it |
 |---|---|---|
-| `tag:clipto` | Who reaches the port | Each node's own packet filter |
+| A tailnet tag | Who reaches the port | Each node's own packet filter |
 | `clipto-psk`, or the node identity | Who gets a payload | The daemon, or the bridge |
 
 **The first gate.** An access rule on the tailnet lets a tagged node reach a
 tagged node, and nobody else. Each node's `tailscaled` enforces it from the
 netmap the control server signs, so it is a real gate and not advice.
 
+`web_tag` names the tag the bridge demands, and it should name a tag your
+devices already carry. A tag of its own buys nothing while a broader rule
+already opens the port to the same devices, and it costs one more thing to set
+on each node — including the phone, which advertises no tag and needs the
+control server to set it.
+
 ```json
 {
-  "tagOwners": { "tag:clipto": ["operator@"] },
   "acls": [
     { "action": "accept",
-      "src": ["tag:clipto"],
-      "dst": ["tag:clipto:17843-17844"] }
+      "src": ["tag:admin"],
+      "dst": ["tag:admin:17843-17844"] }
   ]
 }
 ```
@@ -427,10 +432,11 @@ payload, and `sync_sensitive = false` keeps it on this machine entirely.
   `sync_sensitive = false` when that is too much.
 - **No authentication on the socket.** Any process running as you can copy and
   paste. The socket mode is the only barrier.
-- **Whoever owns the control server writes the tags.** They can therefore give
-  a node of their own `tag:clipto` and reach the bridge. Tailnet lock is the
-  answer to that, and Headscale does not implement it. `clipto-psk` is what
-  stands behind it: it gates the daemons, and the control server never sees it.
+- **Whoever owns the control server writes the tags.** They can give a node of
+  their own the tag that `web_tag` names, and then reach the bridge. Tailnet
+  lock is the answer to that, and Headscale does not implement it. `clipto-psk`
+  is what stands behind it: it gates the daemons, and the control server never
+  sees it.
 - **Every app on a tagged phone can call the bridge.** Such an app can also
   read the system clipboard directly, which is what the bridge serves, so this
   opens nothing that the phone did not already open.
@@ -456,7 +462,7 @@ clipto/
 │   ├── src/noise.rs      # the Noise handshake and the encrypted stream
 │   ├── src/net.rs        # the listener, the announcement, the fetch, the sync
 │   └── tests/sync.rs     # two daemons, one fake tailnet, one clipboard
-├── clipweb/              # the bridge for a phone
+├── clipw/              # the bridge for a phone
 │   ├── src/main.rs       # the listener, the node identity gate, the routes
 │   ├── src/http.rs       # one request in, one answer out
 │   └── tests/bridge.rs   # a real bridge, a fake tailnet, a fake daemon
@@ -652,34 +658,33 @@ Nothing required beyond `tailscale up`. Both programs read `tailscaled` over
 `/var/run/tailscale/tailscaled.sock`, and neither one spawns a process.
 `CLIPTO_TAILSCALED_SOCK` overrides the path.
 
-Add the access rule from [The two gates](#the-two-gates), and give every machine
-and the phone `tag:clipto`. A machine takes it from the key it registers with:
-
-```bash
-tailscale up --auth-key=<key> --advertise-tags=tag:admin,tag:clipto
-```
-
-The iOS app advertises no tag, so set the phone's on the control server. **Pass
-every tag the node already holds.** `headscale nodes tag` says it adds a tag,
-and it does not: it replaces the whole set. A node that loses `tag:admin` here
-matches no access rule at all, and an iPhone cannot re-register itself from a
-shell.
+Add the access rule from [The two gates](#the-two-gates), and check which tag
+your machines and your phone already carry:
 
 ```bash
 headscale nodes list -o json | jq -r '.[]|"\(.id) \(.given_name) \(.tags)"'
+# 2 omen   ["tag:admin"]
 # 8 iphone ["tag:admin"]
-
-headscale nodes tag -i 8 -t tag:admin -t tag:clipto
 ```
+
+Set `web_tag` to that tag. Do not make a new one for the clipboard: a machine
+takes a tag from the key it registers with, and the iOS app advertises none, so
+a second tag is one more thing to set on every node and it gates nothing the
+first one does not.
+
+If you do add one, **pass every tag the node already holds.** `headscale nodes
+tag` says it adds a tag, and it does not: it replaces the whole set. A node that
+loses its first tag matches no access rule at all, and an iPhone cannot
+re-register itself from a shell.
 
 ### 7. The phone
 
 Skip this to keep the clipboard on your machines.
 
-Install `clipweb` and its unit from `contrib/clipweb.service`:
+Install `clipw` and its unit from `contrib/clipw.service`:
 
 ```bash
-systemctl --user enable --now clipweb
+systemctl --user enable --now clipw
 ```
 
 Add one DNS record that holds every machine, so the phone names none. In
@@ -728,7 +733,7 @@ not, so add a notification for the failure.
 ```bash
 cargo build --release
 # binaries at target/release/clipto, target/release/clipd and
-# target/release/clipweb
+# target/release/clipw
 ```
 
 ## Testing
@@ -737,7 +742,7 @@ cargo build --release
 cargo test
 ```
 
-`clipweb/tests/bridge.rs` starts a real bridge. One small server plays
+`clipw/tests/bridge.rs` starts a real bridge. One small server plays
 `tailscaled` and answers `whois`, and a second one plays `clipd`, so the node
 identity gate, the routing and the requests to the daemon all run. Each request
 comes from its own source address, because that address is what the gate reads.

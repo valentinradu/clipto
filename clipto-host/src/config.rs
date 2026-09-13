@@ -49,7 +49,7 @@ impl Default for Config {
             fetch_timeout: 2,
             web_port: 17844,
             web_sensitive: false,
-            web_tag: "tag:clipto".to_string(),
+            web_tag: "tag:admin".to_string(),
             web_device: "tailscale0".to_string(),
         }
     }
@@ -100,7 +100,7 @@ mod tests {
     fn the_defaults_gate_the_bridge() {
         let config = Config::default();
         assert_eq!(config.web_port, 17844);
-        assert_eq!(config.web_tag, "tag:clipto");
+        assert_eq!(config.web_tag, "tag:admin");
         assert!(!config.web_sensitive);
     }
 

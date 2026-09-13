@@ -269,7 +269,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "clipweb"
+name = "clipw"
 version = "0.1.0"
 dependencies = [
  "anyhow",

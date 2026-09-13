@@ -318,12 +318,12 @@ mod tests {
     #[test]
     fn reads_the_name_and_the_tags() {
         let answer = serde_json::json!({
-            "Node": { "Name": "iphone.example.ts.", "Tags": ["tag:admin", "tag:clipto"] },
+            "Node": { "Name": "iphone.example.ts.", "Tags": ["tag:admin", "tag:infra"] },
         });
 
         let who = parse_who(&answer).unwrap();
         assert_eq!(who.name, "iphone.example.ts");
-        assert!(who.has_tag("tag:clipto"));
+        assert!(who.has_tag("tag:admin"));
         assert!(!who.has_tag("tag:edge"));
     }
 
@@ -335,7 +335,7 @@ mod tests {
 
         let who = parse_who(&answer).unwrap();
         assert!(who.tags.is_empty());
-        assert!(!who.has_tag("tag:clipto"));
+        assert!(!who.has_tag("tag:admin"));
     }
 
     /// `tailscaled` answers 200 with an empty object for an address the netmap

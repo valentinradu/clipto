@@ -2,7 +2,7 @@
 members = [
     "clipto",
     "clipd",
-    "clipweb",
+    "clipw",
     "clipto-host",
     "clipto-ipc",
 ]

@@ -6,7 +6,7 @@ After=clipd.service
 Wants=clipd.service
 
 [Service]
-ExecStart=%h/.local/bin/clipweb
+ExecStart=%h/.local/bin/clipw
 Restart=on-failure
 RestartSec=2
 

@@ -62,7 +62,7 @@ fn main() -> Result<()> {
     let config = clipto_host::config::load()?;
 
     eprintln!(
-        "clipweb: port {}, tag {}, sensitive payload {}",
+        "clipw: port {}, tag {}, sensitive payload {}",
         config.web_port,
         config.web_tag,
         if config.web_sensitive {
@@ -83,7 +83,7 @@ fn main() -> Result<()> {
     loop {
         match tailscale::status() {
             Ok(status) => listen(&bridge, &status.own_addresses),
-            Err(e) => eprintln!("clipweb: cannot read the tailnet status: {e:#}"),
+            Err(e) => eprintln!("clipw: cannot read the tailnet status: {e:#}"),
         }
         std::thread::sleep(bridge.config.peer_refresh());
     }
@@ -102,13 +102,13 @@ fn listen(bridge: &Arc<Bridge>, addresses: &[IpAddr]) {
         let listener = match bind(target, &bridge.config.web_device) {
             Ok(listener) => listener,
             Err(e) => {
-                eprintln!("clipweb: failed to listen on {target}: {e:#}");
+                eprintln!("clipw: failed to listen on {target}: {e:#}");
                 bridge.bound.lock().unwrap().remove(address);
                 continue;
             }
         };
 
-        eprintln!("clipweb: listening on {target}");
+        eprintln!("clipw: listening on {target}");
         let bridge = Arc::clone(bridge);
         let address = *address;
         std::thread::spawn(move || {
@@ -118,7 +118,7 @@ fn listen(bridge: &Arc<Bridge>, addresses: &[IpAddr]) {
                         let bridge = Arc::clone(&bridge);
                         std::thread::spawn(move || serve(&bridge, stream));
                     }
-                    Err(e) => eprintln!("clipweb: accept error on {address}: {e}"),
+                    Err(e) => eprintln!("clipw: accept error on {address}: {e}"),
                 }
             }
             bridge.bound.lock().unwrap().remove(&address);
@@ -176,7 +176,7 @@ fn serve(bridge: &Arc<Bridge>, mut stream: TcpStream) {
 
     // Over the limit gets no answer at all. That is what the limit is for.
     if !bridge.limiter.lock().unwrap().allow(address) {
-        eprintln!("clipweb: refused {address}, too many failed requests");
+        eprintln!("clipw: refused {address}, too many failed requests");
         return;
     }
 
@@ -188,7 +188,7 @@ fn serve(bridge: &Arc<Bridge>, mut stream: TcpStream) {
         let who = match gate(bridge, remote) {
             Ok(who) => who,
             Err(e) => {
-                eprintln!("clipweb: refused {address}: {e:#}");
+                eprintln!("clipw: refused {address}: {e:#}");
                 http::write_text(&mut stream, 403, &format!("{e:#}"))?;
                 drain(&mut stream);
                 return Ok(false);
@@ -205,7 +205,7 @@ fn serve(bridge: &Arc<Bridge>, mut stream: TcpStream) {
         Ok(false) => bridge.limiter.lock().unwrap().failed(address),
         Err(e) => {
             bridge.limiter.lock().unwrap().failed(address);
-            eprintln!("clipweb: the request from {address} failed: {e:#}");
+            eprintln!("clipw: the request from {address} failed: {e:#}");
         }
     }
 }
@@ -278,7 +278,7 @@ fn handle(stream: &mut TcpStream, request: &http::Request, who: &Who) -> Result<
 fn get(stream: &mut TcpStream, who: &Who) -> Result<()> {
     if let Response::Error { message } = ask(&Request::Sync)? {
         eprintln!(
-            "clipweb: {} asked for a paste, and the sync said: {message}",
+            "clipw: {} asked for a paste, and the sync said: {message}",
             who.name
         );
     }
@@ -287,13 +287,13 @@ fn get(stream: &mut TcpStream, who: &Who) -> Result<()> {
         target: PasteTarget::Web,
     })? {
         Response::Payload { mut data } => {
-            eprintln!("clipweb: {} took {} bytes", who.name, data.len());
+            eprintln!("clipw: {} took {} bytes", who.name, data.len());
             let result = http::write(stream, 200, "text/plain; charset=utf-8", &data);
             data.zeroize();
             result
         }
         Response::Error { message } => {
-            eprintln!("clipweb: {} got no paste: {message}", who.name);
+            eprintln!("clipw: {} got no paste: {message}", who.name);
             http::write_text(stream, 503, &message)
         }
         _ => http::write_text(
@@ -330,7 +330,7 @@ fn post(stream: &mut TcpStream, request: &http::Request, who: &Who) -> Result<()
     match answer? {
         Response::Ok => {
             eprintln!(
-                "clipweb: {} copied {} bytes{}",
+                "clipw: {} copied {} bytes{}",
                 who.name,
                 request.body.len(),
                 if request.sensitive { ", sensitive" } else { "" }
@@ -338,7 +338,7 @@ fn post(stream: &mut TcpStream, request: &http::Request, who: &Who) -> Result<()
             http::write(stream, 204, "", &[])
         }
         Response::Error { message } => {
-            eprintln!("clipweb: {} could not copy: {message}", who.name);
+            eprintln!("clipw: {} could not copy: {message}", who.name);
             http::write_text(stream, 503, &message)
         }
         _ => http::write_text(
