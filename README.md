@@ -687,19 +687,24 @@ Install `clipw` and its unit from `contrib/clipw.service`:
 systemctl --user enable --now clipw
 ```
 
-Add one DNS record that holds every machine, so the phone names none. In
-Headscale:
+Add one DNS name that holds every machine, so the phone names none. Put it in
+the resolver your tailnet already uses, not in Headscale's `extra_records`:
+those are a map keyed by name, so they serve one address and drop the rest, and
+the phone then has no failover at all.
 
 ```yaml
-dns:
-  extra_records:
-    - { name: "clipto.example.ts", type: "A", value: "100.83.1.11" }
-    - { name: "clipto.example.ts", type: "A", value: "100.83.1.12" }
+# blocky
+customDNS:
+  mapping:
+    clipto.example.ts: 100.83.1.11,100.83.1.12
 ```
 
 One address for each machine that runs the bridge. A machine that runs no
 `clipd` does not belong here, and neither does a name: the record needs an
 address.
+
+This costs you one dependency. The name now needs that resolver to be up,
+where `extra_records` resolved from each node's own cached netmap.
 
 Then build two shortcuts on the phone.
 
